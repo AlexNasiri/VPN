@@ -1,0 +1,6 @@
+fastapi==0.141.1
+uvicorn[standard]==0.52.3
+httpx==0.28.1
+cryptography==45.0.7
+argon2-cffi==25.1.0
+redis[hiredis]==6.4.0
