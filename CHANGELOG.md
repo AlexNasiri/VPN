@@ -1,3 +1,12 @@
+
+## Cloudflare Worker Relay improvements
+
+- Added live Worker health/status checks with last deploy/check timestamps and latency.
+- Added real Worker disable and delete controls using Cloudflare APIs.
+- Added custom domain/subdomain selection and switching via Cloudflare Worker Domains.
+- Improved API Token and permission error messages.
+- Kept the existing Worker name across redeploys to preserve URLs and bindings.
+- Added an in-panel explanation of the Worker Relay flow.
 ### Audit and integration hardening
 - Worker relay now restricts forwarded paths to VLESS tunnel, subscription and readiness endpoints.
 - Worker deployment validates workers.dev activation, resolves the account subdomain, performs a public readiness check, and cleans up failed/orphaned Workers.
@@ -78,7 +87,70 @@ This release consolidates the 4.0 production hardening and the 4.1.1 fixes into 
 
 Historical releases are not reconstructed here because the current repository did not contain a complete, authoritative release history for every older version. Refer to Git history for the original commit-level history.
 
-## Review pass (this session)
+## Review pass (latest session)
+
+### Fixed — Railway restart-loop investigation
+- `/health/ready` was running a full `PRAGMA integrity_check` (a complete
+  scan of the SQLite file) on **every single call** — and it's called
+  repeatedly: every 30s by the Docker `HEALTHCHECK` and periodically by
+  Railway's own health probe. On a small (150-link) test database this was
+  measured at ~10x slower than a trivial query, and the cost grows with DB
+  size (more links, more audit-log/usage history). If it ever took longer
+  than Docker's 5s `HEALTHCHECK` timeout, the container would be marked
+  unhealthy and restarted — which looks identical to "Railway keeps killing
+  the panel" from the outside, with nothing actually wrong. The integrity
+  check now runs exactly once, at process startup (`lifespan`), where a
+  full scan belongs; `/health/ready` now does a cheap `SELECT 1` ping on
+  every call instead (`_db_quick_ping_sync`).
+- `_rate_limiters` (per-link speed-limit token buckets) was never cleaned
+  up when a link was deleted (single delete, bulk delete, or backup
+  restore) — a small, permanent per-uid memory leak over the life of a
+  long-running deployment. Now cleared alongside `_notified_pct` /
+  `link_hourly_traffic` in all three places.
+- (Confirmed already fixed in this codebase, not new in this pass, but
+  directly relevant to "VLESS connects for a few seconds then drops on
+  Railway": the `_tune_socket` TCP_NODELAY fix and the `_allowed_origins`
+  auto-detected-host fix for `RAILWAY_PUBLIC_DOMAIN`. If those symptoms
+  still occur, double-check the deployed image is actually this reviewed
+  version and not an older build.)
+
+## Review pass (previous session)
+
+### Added — User-experience features
+- **صفحه‌ی `/sub/{token}`**: بخش «افزودن مستقیم به اپلیکیشن» با دکمه‌های
+  deep-link برای V2rayNG، Hiddify، Shadowrocket، Clash، Streisand و
+  sing-box (schemeهای مرجع از مستندات رسمی هر اپ / لیست Marzban)، طوری که
+  کاربر نهایی (نه لزوماً فنی) بتواند لینک اشتراک را مستقیماً در اپ نصب‌شده
+  باز کند، بدون نیاز به کپی/پیست دستی.
+- **عملیات گروهی روی جدول لینک‌ها**: چک‌باکس روی هر ردیف + «انتخاب همه»،
+  نوار عملیات دسته‌ای (فعال‌سازی، غیرفعال‌سازی، ریست مصرف، تمدید ۳۰ روزه،
+  حذف) که با یک درخواست `POST /api/links/bulk` روی تا ۵۰۰ لینک هم‌زمان اجرا
+  می‌شود؛ برای نوشتن روی SQLite هم به‌جای یک اتصال جدا به ازای هر لینک، از
+  `executemany` روی یک اتصال مشترک استفاده شده (`_db_bulk_upsert_links` /
+  `_db_bulk_delete_links`).
+- **دکمه‌ی سریع «تمدید ۳۰ روزه» روی هر ردیف** (کنار دکمه‌ی ریست مصرف که از
+  قبل وجود داشت)، برای تمدید تک‌لینکی بدون باز کردن مودال ویرایش.
+- **وضعیت زنده‌ی Cloudflare Worker**: `loadCloudflareStatus` هر ۲۰ ثانیه
+  خودکار اجرا می‌شود (مثل الگوی polling موجود برای Ads Block)، و دکمه‌ی
+  Deploy در حین انتظار برای health-check سمت سرور (که می‌تواند تا چند ده
+  ثانیه طول بکشد) یک شمارنده‌ی ثانیه‌شمار نمایش می‌دهد تا معلوم باشد پنل
+  هنگ نکرده.
+
+## Review pass (previous session)
+
+### Fixed
+- CSP `style-src`/`font-src` did not include `https://fonts.googleapis.com` /
+  `https://fonts.gstatic.com`, even though `FONT_LINKS` (used on every page:
+  login, dashboard, sub, sub-not-found) loads the Vazirmatn/JetBrains Mono
+  stylesheet and fonts from exactly those origins. Browsers enforcing the
+  CSP silently blocked the Google Fonts `<link>` and the referenced font
+  files (visible only as a CSP violation in devtools), so the site always
+  fell back to a generic system font. Both origins are now explicitly
+  allowed.
+- Removed the unused `fastapi.middleware.cors.CORSMiddleware` import; CORS
+  is fully handled by the custom `dynamic_cors_middleware`.
+
+## Review pass (previous session)
 
 ### Fixed
 - `_db_get_settings_sync` now goes through `_db_connect()` (WAL / busy_timeout

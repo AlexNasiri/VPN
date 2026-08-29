@@ -252,6 +252,10 @@ button{cursor:pointer}
 .brand-mark svg{width:20px;height:20px}
 .brand-name{font-weight:800;letter-spacing:.08em;font-size:15px;color:var(--text)}
 .brand-caption{display:block;color:var(--text-dim2);font-size:10px;margin-top:2px}
+.menu-toggle{display:none;width:36px;height:36px;border:1px solid var(--line);background:var(--surface);
+  border-radius:10px;color:var(--text-dim);align-items:center;justify-content:center;font-size:19px;flex:0 0 auto;transition:.15s}
+.menu-toggle:hover{color:var(--accent);border-color:var(--line-hi)}
+.sidebar-menu{display:flex;flex-direction:column;flex:1;min-height:0}
 .nav-label{font-size:10px;color:var(--text-dim2);margin:22px 10px 8px;letter-spacing:.1em;font-family:var(--f-mono)}
 .tb-tabs{display:flex;flex-direction:column;gap:3px}
 .tb-tab{display:flex;align-items:center;gap:11px;padding:11px 12px;border-radius:10px;color:var(--text-dim);
@@ -367,6 +371,10 @@ button{cursor:pointer}
 
 .list-area{min-width:0}
 .list-tools{display:flex;gap:8px;align-items:center;margin-bottom:14px}
+.bulk-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;
+  background:var(--accent-soft);border:1px solid var(--accent);border-radius:11px;padding:9px 12px;margin-bottom:12px}
+.bulk-count{display:flex;align-items:center;gap:6px;font-size:11.5px;font-weight:700;color:var(--accent)}
+.bulk-actions{display:flex;gap:6px;flex-wrap:wrap}
 .filter-row{display:flex;gap:8px;flex:1}
 .filter-row input,.filter-row select{border:1px solid var(--line);background:var(--surface);border-radius:8px;
   padding:10px 11px;font-size:11px;color:var(--text);outline:0}
@@ -441,7 +449,7 @@ button{cursor:pointer}
 .toast.err{background:#3a1518;border-color:rgba(248,113,113,.4)}
 
 @media(max-width:1100px){.app{grid-template-columns:86px minmax(0,1fr)}.sidebar{padding:18px 10px}.brand{justify-content:center;padding-left:0;padding-right:0}.brand-name,.brand-caption,.nav-label,.tb-tab span,.system span,.logout span{display:none}.tb-tab{justify-content:center}.tb-tab .chip{display:none}.overview-intro,.workbench{grid-template-columns:1fr}.link-layout{grid-template-columns:1fr}.create-panel{position:relative;top:auto}.settings-layout{grid-template-columns:1fr}.settings-nav{display:flex;gap:5px;overflow:auto}.settings-nav button{white-space:nowrap;width:auto}.settings-content{grid-template-columns:1fr}}
-@media(max-width:720px){.app{display:block}.sidebar{position:fixed;right:0;left:0;bottom:auto;height:64px;width:100%;padding:7px 10px;flex-direction:row;align-items:center;border-left:0;border-bottom:1px solid var(--line)}.brand{border:0;padding:0}.brand-name,.brand-caption{display:block}.brand-name{font-size:12px}.brand-mark{width:34px;height:34px}.tb-tabs{flex:1;flex-direction:row;overflow:auto;justify-content:flex-start;margin-right:8px}.tb-tab{flex:0 0 auto;padding:9px}.tb-tab span{display:none}.sidebar-foot{display:none}.main{padding-top:64px}.topbar{height:64px;padding:0 15px}.top-pill{display:none}.stage{padding:22px 15px 40px}.page-title{font-size:21px}.signal-row{grid-template-columns:1fr 1fr}.signal:nth-child(2){border-right:0}.signal:nth-child(n+3){border-top:1px solid var(--line)}.intro-copy h1{font-size:26px}.create-grid{grid-template-columns:1fr}.create-grid .wide{grid-column:auto}.list-tools{display:block}.filter-row{margin-bottom:8px;flex-wrap:wrap}.filter-row input{min-width:100%}.clean-page{padding:15px}.conn-row{flex-wrap:wrap}.settings-content{display:block}.setting-section{margin-bottom:14px}}
+@media(max-width:720px){.app{display:block}.sidebar{position:fixed;right:0;left:0;top:0;bottom:auto;height:64px;width:100%;padding:7px 14px;flex-direction:row;align-items:center;border-left:0;border-bottom:1px solid var(--line)}.brand{border:0;padding:0;flex:1;justify-content:flex-start}.brand-name,.brand-caption{display:block}.brand-name{font-size:12px}.brand-mark{width:34px;height:34px}.menu-toggle{display:flex}.sidebar-menu{position:fixed;top:64px;right:0;left:0;max-height:calc(100vh - 64px);overflow:auto;background:var(--bg2);border-bottom:1px solid var(--line);box-shadow:0 20px 40px -20px rgba(0,0,0,.5);padding:4px 15px 18px;transform-origin:top;transform:scaleY(0);opacity:0;pointer-events:none;transition:transform .18s ease,opacity .18s ease;z-index:49;display:block}.sidebar-menu.open{transform:scaleY(1);opacity:1;pointer-events:auto}.sidebar-menu .nav-label{display:block}.tb-tabs{flex-direction:column;gap:3px}.tb-tab{justify-content:flex-start;padding:11px 12px}.tb-tab span{display:inline}.tb-tab .chip{display:inline-block}.sidebar-foot{display:block;margin-top:14px;padding-top:14px}.system span,.logout span{display:inline}.main{padding-top:64px}.topbar{height:64px;padding:0 15px}.top-pill{display:none}.stage{padding:22px 15px 40px}.page-title{font-size:21px}.signal-row{grid-template-columns:1fr 1fr}.signal:nth-child(2){border-right:0}.signal:nth-child(n+3){border-top:1px solid var(--line)}.intro-copy h1{font-size:26px}.create-grid{grid-template-columns:1fr}.create-grid .wide{grid-column:auto}.list-tools{display:block}.filter-row{margin-bottom:8px;flex-wrap:wrap}.filter-row input{min-width:100%}.clean-page{padding:15px}.conn-row{flex-wrap:wrap}.settings-content{display:block}.setting-section{margin-bottom:14px}}
 </style>
 </head>
 <body>
@@ -451,23 +459,26 @@ button{cursor:pointer}
     <div class="brand">
       <div class="brand-mark"><svg viewBox="0 0 24 24" fill="none">""" + BRAND_MARK_SVG + SIGNAL_SVG_DEFS + r"""</svg></div>
       <div><div class="brand-name">VORTEX</div><span class="brand-caption">gateway control</span></div>
+      <button class="menu-toggle" id="menuToggle" aria-label="باز کردن منو"><i class="ti ti-menu-2"></i></button>
     </div>
-    <div class="nav-label">WORKSPACE</div>
-    <nav class="tb-tabs" id="tabs">
-      <div class="tb-tab active" data-page="overview"><i class="ti ti-home-2"></i><span>خانه</span></div>
-      <div class="tb-tab" data-page="links"><i class="ti ti-route"></i><span>کانفیگ‌ها</span><span class="chip" id="linksBadge">0</span></div>
-      <div class="tb-tab" data-page="traffic"><i class="ti ti-wave-sine"></i><span>مصرف</span></div>
-      <div class="tb-tab" data-page="connections"><i class="ti ti-activity-heartbeat"></i><span>زنده</span><span class="chip" id="connsBadge">0</span></div>
-      <div class="tb-tab" data-page="errors"><i class="ti ti-shield-exclamation"></i><span>گزارش خطا</span></div>
-    </nav>
-    <div class="nav-label">SYSTEM</div>
-    <nav class="tb-tabs">
-      <div class="tb-tab" data-page="system"><i class="ti ti-server-2"></i><span>وضعیت سیستم</span></div>
-      <div class="tb-tab" data-page="settings"><i class="ti ti-adjustments-horizontal"></i><span>تنظیمات</span></div>
-    </nav>
-    <div class="sidebar-foot">
-      <div class="system"><span class="system-dot"></span><span>Gateway online</span></div>
-      <button class="logout" id="logoutBtn"><i class="ti ti-logout-2"></i><span>خروج از پنل</span></button>
+    <div class="sidebar-menu" id="sidebarMenu">
+      <div class="nav-label">WORKSPACE</div>
+      <nav class="tb-tabs" id="tabs">
+        <div class="tb-tab active" data-page="overview"><i class="ti ti-home-2"></i><span>خانه</span></div>
+        <div class="tb-tab" data-page="links"><i class="ti ti-route"></i><span>کانفیگ‌ها</span><span class="chip" id="linksBadge">0</span></div>
+        <div class="tb-tab" data-page="traffic"><i class="ti ti-wave-sine"></i><span>مصرف</span></div>
+        <div class="tb-tab" data-page="connections"><i class="ti ti-activity-heartbeat"></i><span>زنده</span><span class="chip" id="connsBadge">0</span></div>
+        <div class="tb-tab" data-page="errors"><i class="ti ti-shield-exclamation"></i><span>گزارش خطا</span></div>
+      </nav>
+      <div class="nav-label">SYSTEM</div>
+      <nav class="tb-tabs">
+        <div class="tb-tab" data-page="system"><i class="ti ti-server-2"></i><span>وضعیت سیستم</span></div>
+        <div class="tb-tab" data-page="settings"><i class="ti ti-adjustments-horizontal"></i><span>تنظیمات</span></div>
+      </nav>
+      <div class="sidebar-foot">
+        <div class="system"><span class="system-dot"></span><span>Gateway online</span></div>
+        <button class="logout" id="logoutBtn"><i class="ti ti-logout-2"></i><span>خروج از پنل</span></button>
+      </div>
     </div>
   </aside>
 
@@ -523,6 +534,17 @@ button{cursor:pointer}
           </aside>
           <div class="list-area">
             <div class="list-tools"><div class="filter-row"><input type="text" id="linkSearch" placeholder="جستجو در کانفیگ‌ها..."><select id="linkFilterStatus"><option value="all">همه</option><option value="active">فعال</option><option value="inactive">غیرفعال</option><option value="expired">منقضی</option></select><select id="linkSort"><option value="created_desc">جدیدترین</option><option value="created_asc">قدیمی‌ترین</option><option value="usage_desc">بیشترین مصرف</option><option value="label_asc">عنوان</option></select></div></div>
+            <div class="bulk-bar" id="bulkBar" style="display:none">
+              <span class="bulk-count"><i class="ti ti-checkbox"></i> <span id="bulkCount">0</span> لینک انتخاب شده</span>
+              <div class="bulk-actions">
+                <button class="btn btn-sm btn-outline" data-bulk="activate"><i class="ti ti-player-play"></i> فعال‌سازی</button>
+                <button class="btn btn-sm btn-outline" data-bulk="deactivate"><i class="ti ti-player-pause"></i> غیرفعال‌سازی</button>
+                <button class="btn btn-sm btn-outline" data-bulk="reset"><i class="ti ti-refresh"></i> ریست مصرف</button>
+                <button class="btn btn-sm btn-outline" data-bulk="extend30"><i class="ti ti-calendar-plus"></i> تمدید ۳۰ روز</button>
+                <button class="btn btn-sm btn-danger" data-bulk="delete"><i class="ti ti-trash"></i> حذف</button>
+                <button class="btn btn-sm" id="bulkClearBtn"><i class="ti ti-x"></i> لغو انتخاب</button>
+              </div>
+            </div>
             <div class="table-shell" id="linksTableWrap"></div>
           </div>
         </div>
@@ -561,16 +583,38 @@ button{cursor:pointer}
           <nav class="settings-nav"><button>امنیت</button><button>داده‌ها</button><button>اعلان‌ها</button></nav>
           <div class="settings-content">
             <section class="setting-section"><h3>امنیت پنل</h3><p>رمز عبور مدیریت را بدون تغییر سایر تنظیمات سرویس به‌روزرسانی کن.</p><div class="setting-form"><div class="field"><label>رمز فعلی</label><input type="password" id="curPass"></div><div class="field"><label>رمز جدید</label><input type="password" id="newPass"></div><button class="btn btn-grad" id="changePasswordBtn"><i class="ti ti-lock-check"></i> ذخیره رمز</button></div></section>
-            <section class="setting-section wide"><h3>اتصال کلادفلر</h3><p>یک Worker رایگان روی Cloudflare می‌سازد (تا سقف رایگان، حدود ۱۰۰ هزار درخواست در روز) که ترافیک گیت‌وی از پشت آن رد می‌شود. فقط کافیست روی دکمه‌ی زیر بزنی، توکن را با یک کلیک بسازی و همینجا بچسبانی؛ Account ID را خودِ سیستم از روی توکن پیدا می‌کند.</p>
-              <div class="setting-form">
-                <div class="field"><label>API Token کلادفلر</label><div style="display:flex;gap:8px"><input type="password" id="cfApiToken" autocomplete="off" placeholder="بعد از ساخت توکن، اینجا بچسبان" style="flex:1"><button class="btn" id="cfPasteTokenBtn" type="button" title="چسباندن از کلیپ‌بورد"><i class="ti ti-clipboard"></i></button></div></div>
-                <button class="btn" id="cfOpenTokenBtn" type="button" style="width:100%;justify-content:center"><i class="ti ti-external-link"></i> ساخت توکن در کلادفلر</button>
-                <button class="btn btn-grad" id="cfDeployBtn" type="button"><i class="ti ti-cloud-bolt"></i> ساخت با کلادفلر</button>
+            <section class="setting-section wide"><h3>Cloudflare Worker Relay</h3>
+              <p>Worker فقط <strong>Relay</strong> است: <span dir="ltr">Client → Cloudflare Worker → Vortex Gateway</span>. منطق VLESS و احراز هویت روی Gateway می‌ماند؛ Worker صرفاً درخواست را به Origin عبور می‌دهد.</p>
+              <div id="cfStatusBox" style="margin:12px 0;padding:13px;border:1px solid var(--line);border-radius:12px;background:var(--bg2)">
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px"><strong>وضعیت Worker</strong><span id="cfStatusBadge" class="badge dim">بررسی نشده</span></div>
+                <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 14px;font-size:10px;line-height:1.9">
+                  <div>Worker: <b id="cfStatusName">—</b></div><div>Latency: <b id="cfStatusLatency">—</b></div>
+                  <div>آخرین Deploy: <b id="cfStatusDeployedAt">—</b></div><div>آخرین Check: <b id="cfStatusCheckedAt">—</b></div>
+                  <div style="grid-column:1/-1;direction:ltr;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">URL: <b id="cfStatusUrl">—</b></div>
+                  <div style="grid-column:1/-1;color:var(--text-dim)" id="cfStatusError"></div>
+                </div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><button class="btn" id="cfRefreshStatusBtn" type="button"><i class="ti ti-refresh"></i> بررسی وضعیت</button><button class="btn" id="cfDisableBtn" type="button" style="border-color:rgba(255,180,0,.35);color:#ffd166"><i class="ti ti-player-pause"></i> غیرفعال‌سازی</button><button class="btn" id="cfDeleteBtn" type="button" style="border-color:rgba(255,80,80,.35);color:#ff8f8f"><i class="ti ti-trash"></i> حذف کامل Worker</button></div>
               </div>
-              <div id="cfWorkerInfo" style="display:none;margin-top:14px;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--bg2);font-size:11px;line-height:2"></div>
+
+              <div class="setting-form">
+                <div class="field"><label>API Token کلادفلر</label><div style="display:flex;gap:8px"><input type="password" id="cfApiToken" autocomplete="off" placeholder="برای Deploy / تغییر دامنه / حذف لازم است" style="flex:1"><button class="btn" id="cfPasteTokenBtn" type="button" title="چسباندن از کلیپ‌بورد"><i class="ti ti-clipboard"></i></button></div></div>
+                <button class="btn" id="cfOpenTokenBtn" type="button" style="width:100%;justify-content:center"><i class="ti ti-external-link"></i> ساخت Token با دسترسی پیشنهادی</button>
+                <div class="field"><label>نوع آدرس Worker</label><select id="cfDomainMode" style="width:100%"><option value="workers_dev">workers.dev (ساده و فوری)</option><option value="custom">دامنه / زیردامنه اختصاصی</option></select></div>
+                <div class="field" id="cfHostnameWrap" style="display:none"><label>دامنه یا زیردامنه</label><div style="display:flex;gap:8px"><input id="cfHostname" autocomplete="off" placeholder="relay.example.com" style="flex:1"><button class="btn" id="cfLoadDomainsBtn" type="button" title="نمایش دامنه‌های قبلاً متصل‌شده"><i class="ti ti-list"></i></button></div><small style="color:var(--text-dim)">دامنه باید داخل Cloudflare باشد؛ Custom Domain خودش DNS و گواهی لازم را مدیریت می‌کند.</small></div>
+                <button class="btn btn-grad" id="cfDeployBtn" type="button"><i class="ti ti-cloud-bolt"></i> Deploy / بروزرسانی Worker</button>
+              </div>
+              <div id="cfDomainList" style="display:none;margin-top:10px;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--bg2)"></div>
+              <div id="cfWorkerInfo" style="display:none;margin-top:12px;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--bg2);font-size:11px;line-height:2"></div>
             </section>
             <section class="setting-section"><h3>بکاپ و بازیابی</h3><p>از تنظیمات و لینک‌ها نسخه پشتیبان بگیر یا یک فایل قبلی را برگردان.</p><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-grad" id="downloadBackupBtn"><i class="ti ti-download"></i> دریافت بکاپ</button><button class="btn" id="restoreFileBtn"><i class="ti ti-upload"></i> بازیابی</button><input type="file" id="restoreFile" accept=".vortex,application/octet-stream" style="display:none"></div></section>
             <section class="setting-section wide"><h3>اعلان تلگرام</h3><p>وضعیت اتصال و ارسال پیام تست را از این بخش کنترل کن.</p><div class="mini-stat" style="max-width:520px"><span>وضعیت اتصال</span><strong id="telegramStatus">—</strong></div><button class="btn" id="sendTestNotifBtn" style="margin-top:12px"><i class="ti ti-send"></i> ارسال پیام تست</button></section>
+            <section class="setting-section wide"><h3>مسدودسازی تبلیغات</h3><p>وقتی فعال باشد، مقصدهای شناخته‌شده‌ی تبلیغاتی/ردیاب (مثل شبکه‌های تبلیغاتی و آنالیتیکس پراستفاده) پیش از اتصال، مستقیم توسط گیت‌وی بسته می‌شوند — روی همه‌ی کانفیگ‌های VLESS به‌صورت یکجا اثر می‌گذارد.</p>
+              <div class="mini-stat" style="max-width:520px;margin-bottom:12px"><span>وضعیت</span><button class="toggle" id="adsBlockToggle" title="فعال / غیرفعال"></button></div>
+              <div class="mini-stat" style="max-width:520px"><span>لیست پایه</span><strong id="adsBlockBuiltinCount">—</strong></div>
+              <div class="mini-stat" style="max-width:520px"><span>مسدودشده تاکنون</span><strong id="adsBlockCount">0</strong></div>
+              <div class="field wide" style="margin-top:12px"><label>دامنه‌های سفارشی (هر خط یک دامنه)</label><textarea id="adsBlockCustomDomains" rows="4" placeholder="example-ads.com&#10;tracker.example.net" style="width:100%;background:var(--bg2);border:1px solid var(--line);border-radius:8px;color:var(--text);font:11px var(--f-mono);padding:10px;resize:vertical"></textarea></div>
+              <button class="btn btn-grad" id="adsBlockSaveDomainsBtn" style="margin-top:10px"><i class="ti ti-device-floppy"></i> ذخیره دامنه‌های سفارشی</button>
+            </section>
           </div>
         </div>
       </section>
@@ -635,8 +679,20 @@ function expiryDateStrToDays(isoString){
 function goPage(name){
   document.querySelectorAll('.tb-tab').forEach(i=>i.classList.toggle('active', i.dataset.page===name));
   document.querySelectorAll('.vx-page').forEach(p=>p.classList.toggle('active', p.id==='page-'+name));
+  closeMobileMenu();
 }
 document.querySelectorAll('.tb-tab').forEach(tab=>tab.addEventListener('click', ()=>goPage(tab.dataset.page)));
+
+const menuToggleBtn = document.getElementById('menuToggle');
+const sidebarMenuEl = document.getElementById('sidebarMenu');
+function closeMobileMenu(){ sidebarMenuEl.classList.remove('open'); }
+function toggleMobileMenu(){ sidebarMenuEl.classList.toggle('open'); }
+menuToggleBtn.addEventListener('click', (e)=>{ e.stopPropagation(); toggleMobileMenu(); });
+document.addEventListener('click', (e)=>{
+  if(!sidebarMenuEl.classList.contains('open')) return;
+  if(sidebarMenuEl.contains(e.target) || menuToggleBtn.contains(e.target)) return;
+  closeMobileMenu();
+});
 
 document.getElementById('logoutBtn').addEventListener('click', async ()=>{await apiFetch('/api/logout',{method:'POST'});location.href='/login';});
 
@@ -674,6 +730,7 @@ document.getElementById('linksTableWrap').addEventListener('click', (e)=>{
     case 'chart': showLinkChart(uid); break;
     case 'edit': openEditModal(uid); break;
     case 'reset': resetLink(uid); break;
+    case 'extend30': extendLink30(uid); break;
     case 'delete': deleteLink(uid); break;
   }
 });
@@ -828,7 +885,9 @@ function renderLinksTable(){
         ? '<span class="badge warn"><i class="ti ti-clock-off"></i> منقضی</span>'
         : `<span class="badge ok"><i class="ti ti-calendar-due"></i> تا ${fmtDate(l.expires_at)}</span>`;
     }
+    const checked = selectedLinkUids.has(l.uuid) ? 'checked' : '';
     return `<tr>
+      <td><input type="checkbox" class="row-check" data-uuid="${l.uuid}" ${checked}></td>
       <td>${escapeHtml(l.label)}</td>
       <td><span class="uid-chip">${l.uuid.slice(0,8)}...</span></td>
       <td><div class="usage-wrap"><div class="usage-bar"><div class="usage-fill" style="width:${pct}%"></div></div>
@@ -842,11 +901,77 @@ function renderLinksTable(){
         <button class="btn btn-sm btn-outline" data-action="chart" data-uuid="${l.uuid}" title="نمودار مصرف"><i class="ti ti-chart-line"></i></button>
         <button class="btn btn-sm btn-outline" data-action="edit" data-uuid="${l.uuid}" title="ویرایش"><i class="ti ti-edit"></i></button>
         <button class="btn btn-sm btn-outline" data-action="reset" data-uuid="${l.uuid}" title="بازنشانی مصرف"><i class="ti ti-refresh"></i></button>
+        <button class="btn btn-sm btn-outline" data-action="extend30" data-uuid="${l.uuid}" title="تمدید ۳۰ روزه انقضا"><i class="ti ti-calendar-plus"></i></button>
         <button class="btn btn-sm btn-danger" data-action="delete" data-uuid="${l.uuid}" title="حذف"><i class="ti ti-trash"></i></button>
       </td>
     </tr>`;
   }).join('');
-  wrap.innerHTML = `<table class="vx-table"><thead><tr><th>عنوان</th><th>شناسه</th><th>مصرف</th><th>انقضا / سرعت</th><th>فعال</th><th>عملیات</th></tr></thead><tbody>${rows}</tbody></table>`;
+  wrap.innerHTML = `<table class="vx-table"><thead><tr><th><input type="checkbox" id="selectAllLinks"></th><th>عنوان</th><th>شناسه</th><th>مصرف</th><th>انقضا / سرعت</th><th>فعال</th><th>عملیات</th></tr></thead><tbody>${rows}</tbody></table>`;
+  const selectAllEl = document.getElementById('selectAllLinks');
+  const visibleUids = filtered.map(l=>l.uuid);
+  selectAllEl.checked = visibleUids.length>0 && visibleUids.every(u=>selectedLinkUids.has(u));
+  selectAllEl.addEventListener('change', ()=>{
+    if(selectAllEl.checked) visibleUids.forEach(u=>selectedLinkUids.add(u));
+    else visibleUids.forEach(u=>selectedLinkUids.delete(u));
+    updateBulkBar();
+    renderLinksTable();
+  });
+  wrap.querySelectorAll('.row-check').forEach(cb=>{
+    cb.addEventListener('change', ()=>{
+      const uid = cb.dataset.uuid;
+      if(cb.checked) selectedLinkUids.add(uid); else selectedLinkUids.delete(uid);
+      updateBulkBar();
+    });
+  });
+}
+
+// ───── انتخاب چندتایی و عملیات دسته‌ای روی جدول لینک‌ها ─────
+const selectedLinkUids = new Set();
+function updateBulkBar(){
+  const bar = document.getElementById('bulkBar');
+  const count = selectedLinkUids.size;
+  document.getElementById('bulkCount').textContent = count;
+  bar.style.display = count>0 ? 'flex' : 'none';
+}
+document.getElementById('bulkClearBtn').addEventListener('click', ()=>{
+  selectedLinkUids.clear();
+  updateBulkBar();
+  renderLinksTable();
+});
+const BULK_CONFIRM = {
+  delete: 'همه‌ی لینک‌های انتخاب‌شده برای همیشه حذف شوند؟',
+  deactivate: 'همه‌ی لینک‌های انتخاب‌شده غیرفعال شوند؟',
+};
+const BULK_SUCCESS_MSG = {
+  delete: 'حذف شد', reset: 'مصرف بازنشانی شد', activate: 'فعال شد',
+  deactivate: 'غیرفعال شد', extend30: 'انقضا ۳۰ روز تمدید شد',
+};
+document.getElementById('bulkBar').addEventListener('click', async (e)=>{
+  const btn = e.target.closest('[data-bulk]');
+  if(!btn) return;
+  const action = btn.dataset.bulk;
+  const uids = Array.from(selectedLinkUids);
+  if(uids.length===0) return;
+  const confirmMsg = BULK_CONFIRM[action];
+  if(confirmMsg && !confirm(`${confirmMsg} (${uids.length} لینک)`)) return;
+  btn.disabled = true;
+  try{
+    const r = await apiFetch('/api/links/bulk', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({uids, action})});
+    const d = await r.json().catch(()=>({}));
+    if(r.ok){
+      toast(`${d.affected} لینک: ${BULK_SUCCESS_MSG[action]||'انجام شد'}`);
+      selectedLinkUids.clear();
+      await loadLinks();
+    } else toast(d.detail||'خطا در انجام عملیات گروهی', true);
+  } catch(e){ toast('خطا در ارتباط با سرور', true); }
+  finally{ btn.disabled = false; }
+});
+async function extendLink30(uid){
+  const r = await apiFetch('/api/links/bulk', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({uids:[uid], action:'extend30'})});
+  if(r.ok){ toast('انقضا ۳۰ روز تمدید شد'); loadLinks(); }
+  else toast('خطا در تمدید انقضا', true);
 }
 
 function routeBadge(routeVia){
@@ -1002,24 +1127,85 @@ document.getElementById('cfPasteTokenBtn')?.addEventListener('click', async ()=>
   }catch(e){ toast('اجازه‌ی خواندن کلیپ‌بورد داده نشد؛ با Ctrl+V دستی بچسبان', true); }
 });
 document.getElementById('cfDeployBtn').addEventListener('click', deployCloudflareWorker);
+document.getElementById('cfRefreshStatusBtn')?.addEventListener('click', loadCloudflareStatus);
+document.getElementById('cfDisableBtn')?.addEventListener('click', disableCloudflareWorker);
+document.getElementById('cfDeleteBtn')?.addEventListener('click', deleteCloudflareWorker);
+document.getElementById('cfLoadDomainsBtn')?.addEventListener('click', loadCloudflareDomains);
+document.getElementById('cfDomainMode')?.addEventListener('change', ()=>{
+  const custom=document.getElementById('cfDomainMode').value==='custom';
+  document.getElementById('cfHostnameWrap').style.display=custom?'block':'none';
+});
+
+function cfFormatDate(v){ if(!v) return '—'; try{return new Date(v).toLocaleString('fa-IR');}catch(e){return v;} }
+function cfStatusText(s){ return ({healthy:'سالم',inactive:'غیرفعال / پیدا نشد',unreachable:'در دسترس نیست',degraded:'ناپایدار',disabled:'غیرفعال',deleted:'حذف شده',not_configured:'تنظیم نشده'})[s]||s||'بررسی نشده'; }
+function cfRenderStatus(d){
+  const badge=document.getElementById('cfStatusBadge'); if(!badge) return;
+  const status=d.status||'not_configured'; badge.textContent=cfStatusText(status); badge.className='badge '+(status==='healthy'?'ok':(status==='disabled'||status==='deleted'||status==='not_configured'?'dim':'relay'));
+  document.getElementById('cfStatusName').textContent=d.worker_name||'—';
+  document.getElementById('cfStatusLatency').textContent=d.latency_ms!=null?d.latency_ms+' ms':'—';
+  document.getElementById('cfStatusDeployedAt').textContent=cfFormatDate(d.deployed_at);
+  document.getElementById('cfStatusCheckedAt').textContent=cfFormatDate(d.checked_at||d.last_checked_at);
+  document.getElementById('cfStatusUrl').textContent=d.worker_url||d.url||'—';
+  document.getElementById('cfStatusError').textContent=d.error||'';
+  const custom=d.domain_mode==='custom'; document.getElementById('cfDomainMode').value=custom?'custom':'workers_dev'; document.getElementById('cfHostnameWrap').style.display=custom?'block':'none'; if(custom) document.getElementById('cfHostname').value=d.hostname||'';
+  const hasWorker=!!d.worker_name; document.getElementById('cfDisableBtn').disabled=!hasWorker; document.getElementById('cfDeleteBtn').disabled=!hasWorker;
+  // Keep the "همیشه از طریق Cloudflare Worker" route option in sync with reality.
+  // Without this, disabling/deleting the Worker left that option selectable in
+  // the new/edit-link dropdowns until a full page reload, letting an admin
+  // create or keep links routed through a Worker that no longer exists.
+  cloudflareConfigured = !!d.configured;
+  applyCloudflareAvailability();
+}
+async function loadCloudflareStatus(){
+  try{ const r=await apiFetch('/api/cloudflare/status'); const d=await r.json().catch(()=>({})); if(r.ok){cfRenderStatus(d);} else toast(d.detail||'خطا در بررسی وضعیت Worker',true); }catch(e){toast('بررسی وضعیت Worker انجام نشد',true);}
+}
+async function loadCloudflareDomains(){
+  const api_token=document.getElementById('cfApiToken').value.trim(); if(!api_token){toast('اول API Token را وارد کن',true);return;}
+  const box=document.getElementById('cfDomainList'); box.style.display='block'; box.textContent='در حال خواندن دامنه‌ها...';
+  try{ const r=await apiFetch('/api/cloudflare/domains',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_token})}); const d=await r.json().catch(()=>({})); if(!r.ok){box.textContent=d.detail||'خواندن دامنه‌ها ناموفق بود';return;}
+    const domains=d.domains||[]; if(!domains.length){box.textContent='هیچ Custom Domain متصل‌شده‌ای برای Workerها پیدا نشد. دامنه را دستی وارد کن.';return;}
+    box.innerHTML=domains.map(x=>'<button type="button" class="btn" style="margin:3px" data-cf-host="'+escapeHtml(x.hostname)+'">'+escapeHtml(x.hostname)+(x.service?' · '+escapeHtml(x.service):'')+'</button>').join('');
+    box.querySelectorAll('[data-cf-host]').forEach(b=>b.addEventListener('click',()=>{document.getElementById('cfDomainMode').value='custom';document.getElementById('cfHostnameWrap').style.display='block';document.getElementById('cfHostname').value=b.getAttribute('data-cf-host');}));
+  }catch(e){box.textContent='ارتباط با سرور انجام نشد';}
+}
+async function cloudflareAction(endpoint, label, confirmText){
+  const api_token=document.getElementById('cfApiToken').value.trim(); if(!api_token){toast('API Token را وارد کن',true);return;}
+  if(!confirm(confirmText)) return; const btn=endpoint.includes('delete')?document.getElementById('cfDeleteBtn'):document.getElementById('cfDisableBtn'); btn.disabled=true;
+  try{const r=await apiFetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_token})}); const d=await r.json().catch(()=>({})); if(!r.ok){toast(d.detail||label+' ناموفق بود',true);return;} toast(label+' با موفقیت انجام شد'); await loadCloudflareStatus();}catch(e){toast('خطا در ارتباط با سرور',true);}finally{btn.disabled=false;}
+}
+async function disableCloudflareWorker(){ return cloudflareAction('/api/cloudflare/disable-worker','غیرفعال‌سازی','Worker غیرفعال می‌شود و لینک‌های عبوری دیگر از آن قابل استفاده نخواهند بود. ادامه می‌دهی؟'); }
+async function deleteCloudflareWorker(){ return cloudflareAction('/api/cloudflare/delete-worker','حذف Worker','Worker و اتصال دامنه‌اش از Cloudflare حذف می‌شود. این کار قابل برگشت خودکار نیست. ادامه می‌دهی؟'); }
 
 async function deployCloudflareWorker(){
   const api_token=document.getElementById('cfApiToken').value.trim();
   if(!api_token){toast('API Token را وارد کن', true);return;}
   const btn=document.getElementById('cfDeployBtn');
   const originalLabel=btn.innerHTML;
-  btn.disabled=true; btn.innerHTML='در حال ساخت...';
+  btn.disabled=true;
+  // این عملیات سمت سرور تا سالم‌شدن واقعی Worker صبر می‌کند (ممکن است چند
+  // ده ثانیه طول بکشد). بدون این تایمر، دکمه‌ی «در حال ساخت...» ثابت
+  // می‌ماند و کاربر فکر می‌کند پنل هنگ کرده؛ شمارنده نشان می‌دهد که هنوز
+  // در حال انجام است، نه گیر کرده.
+  const startedAt = Date.now();
+  const tickTimer = setInterval(()=>{
+    const secs = Math.floor((Date.now()-startedAt)/1000);
+    btn.innerHTML = `در حال ساخت و بررسی سلامت Worker... (${secs}s)`;
+  }, 1000);
+  btn.innerHTML = 'در حال ساخت و بررسی سلامت Worker... (0s)';
   try{
-    const r=await apiFetch('/api/cloudflare/deploy-worker',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_token})});
+    const domain_mode=document.getElementById('cfDomainMode').value;
+     const hostname=document.getElementById('cfHostname').value.trim();
+     const r=await apiFetch('/api/cloudflare/deploy-worker',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_token,domain_mode,hostname})});
     const d=await r.json().catch(()=>({}));
     if(r.ok){
       document.getElementById('cfApiToken').value='';
-      toast('با موفقیت ثبت شد');
+      toast('Worker با موفقیت Deploy/بروزرسانی شد');
       cloudflareConfigured = true;
       applyCloudflareAvailability();
+      await loadCloudflareStatus();
     } else toast(d.detail||'خطا در ساخت Worker', true);
   }catch(e){ toast('خطا در ارتباط با سرور', true); }
-  finally{ btn.disabled=false; btn.innerHTML=originalLabel; }
+  finally{ clearInterval(tickTimer); btn.disabled=false; btn.innerHTML=originalLabel; }
 }
 
 async function downloadBackup(){
@@ -1104,6 +1290,45 @@ async function loadSystemStatus(){
   }catch(e){toast('دریافت وضعیت سیستم ناموفق بود', true);}
 }
 
+let adsBlockEnabled = false;
+function renderAdsBlockState(d){
+  adsBlockEnabled = !!d.enabled;
+  document.getElementById('adsBlockToggle').classList.toggle('on', adsBlockEnabled);
+  document.getElementById('adsBlockBuiltinCount').textContent = (d.builtin_count ?? 0) + ' دامنه';
+  document.getElementById('adsBlockCount').textContent = d.blocked_count ?? 0;
+  if(document.activeElement !== document.getElementById('adsBlockCustomDomains')){
+    document.getElementById('adsBlockCustomDomains').value = (d.custom_domains || []).join('\n');
+  }
+}
+async function loadAdsBlockSettings(){
+  try{
+    const r = await apiFetch('/api/settings/ads-block');
+    if(!r.ok) return;
+    renderAdsBlockState(await r.json());
+  }catch(e){}
+}
+async function toggleAdsBlock(){
+  const nextEnabled = !adsBlockEnabled;
+  try{
+    const r = await apiFetch('/api/settings/ads-block', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({enabled: nextEnabled})});
+    if(!r.ok) throw new Error('save failed');
+    renderAdsBlockState(await r.json());
+    toast(nextEnabled ? 'مسدودسازی تبلیغات فعال شد' : 'مسدودسازی تبلیغات غیرفعال شد');
+  }catch(e){ toast('تغییر وضعیت ادز بلاکر ناموفق بود', true); }
+}
+async function saveAdsBlockCustomDomains(){
+  const domains = document.getElementById('adsBlockCustomDomains').value
+    .split('\n').map(s=>s.trim()).filter(Boolean);
+  try{
+    const r = await apiFetch('/api/settings/ads-block', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({enabled: adsBlockEnabled, custom_domains: domains})});
+    if(!r.ok) throw new Error('save failed');
+    renderAdsBlockState(await r.json());
+    toast('دامنه‌های سفارشی ذخیره شد');
+  }catch(e){ toast('ذخیره دامنه‌های سفارشی ناموفق بود', true); }
+}
+document.getElementById('adsBlockToggle').addEventListener('click', toggleAdsBlock);
+document.getElementById('adsBlockSaveDomainsBtn').addEventListener('click', saveAdsBlockCustomDomains);
+
 async function loadSetupStatus(){
   try{
     const r=await fetch('/api/setup/status');
@@ -1132,8 +1357,15 @@ document.getElementById('setupDoneBtn').addEventListener('click', async()=>{
   if(!me.authenticated){location.href='/login';return;}
   await loadSetupStatus();
   await loadSystemStatus();
+  await loadCloudflareStatus();
+  await loadAdsBlockSettings();
   await refreshAll();
   setInterval(refreshAll, 8000);
+  setInterval(loadAdsBlockSettings, 15000);
+  // وضعیت Worker کلادفلر (سالم/ناسالم/latency) را خودکار و دوره‌ای تازه نگه
+  // می‌دارد تا کاربر مجبور نباشد برای دیدن نتیجه‌ی واقعی بعد از دیپلوی/تغییر
+  // دامنه، دستی روی «بررسی وضعیت» کلیک کند یا کل صفحه را رفرش کند.
+  setInterval(loadCloudflareStatus, 20000);
 })();
 </script>
 </body>
@@ -1201,6 +1433,15 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .btn-grad:hover{filter:brightness(1.06)}
 .btn-outline{background:transparent;border:1px solid var(--line);color:var(--text)}
 .btn-outline:hover{border-color:var(--accent);color:var(--accent)}
+.quick-connect{margin-top:4px;padding-top:16px;border-top:1px solid var(--line-soft)}
+.quick-connect-title{display:flex;align-items:center;gap:6px;font-size:11.5px;font-weight:700;color:var(--text-dim);margin-bottom:10px}
+.quick-connect-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.qc-btn{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;padding:10px 4px;
+  border:1px solid var(--line);border-radius:11px;background:var(--surface3);color:var(--text);cursor:pointer;
+  font-family:var(--f-body);font-size:10px;font-weight:600;transition:.15s;text-align:center}
+.qc-btn:hover{border-color:var(--accent);color:var(--accent);transform:translateY(-1px)}
+.qc-btn i{font-size:18px}
+.quick-connect-hint{margin-top:10px;font-size:10.5px;color:var(--text-dim2);line-height:1.8;text-align:center}
 .sub-hint{margin-top:18px;text-align:center;font-size:11.5px;color:var(--text-dim2);line-height:1.8}
 .foot{margin-top:20px;text-align:center;font-family:var(--f-mono);font-size:10px;letter-spacing:.08em;color:var(--text-dim2)}
 </style>
@@ -1237,6 +1478,13 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
         <button class="btn btn-grad" id="copySubBtn"><i class="ti ti-copy"></i> کپی لینک اشتراک (Subscription)</button>
         <button class="btn btn-outline" id="copyVlessBtn"><i class="ti ti-copy"></i> کپی لینک مستقیم VLESS</button>
       </div>
+      <div class="quick-connect">
+        <div class="quick-connect-title"><i class="ti ti-bolt"></i> افزودن مستقیم به اپلیکیشن</div>
+        <div class="quick-connect-grid" id="quickConnectGrid"></div>
+        <p class="quick-connect-hint">اگر اپ روی گوشی/سیستم نصب باشد، با لمس هرکدام لینک اشتراک مستقیم داخل همان
+          اپ باز می‌شود. اگر نصب نباشد معمولاً هیچ اتفاقی نمی‌افتد — در آن صورت لینک اشتراک را دستی کپی و
+          «Import from URL» / «Subscribe» کنید.</p>
+      </div>
       <p class="sub-hint">این آدرس صفحه را در اپلیکیشن‌هایی مثل V2rayNG، NekoBox، Shadowrocket، Streisand یا Clash
         به‌عنوان «Subscription» / «Import from URL» وارد کنید تا لینک به‌صورت خودکار در اپ اضافه شود؛ یا لینک مستقیم
         بالا را دستی کپی/اسکن کنید.</p>
@@ -1259,6 +1507,32 @@ document.getElementById('copySubBtn').addEventListener('click', (e)=>{
 document.getElementById('copyVlessBtn').addEventListener('click', (e)=>{
   navigator.clipboard.writeText(__VLESS_LINK_JSON__);
   flashCopied(e.currentTarget);
+});
+
+// شماهای URL که هرکدام از این اپ‌ها برای افزودن مستقیم یک لینک اشتراک
+// پشتیبانی می‌کنند (منبع: مستندات رسمی همان اپ‌ها / لیست مرجع Marzban).
+// اگر اپ نصب نباشد مرورگر معمولاً کاری نمی‌کند؛ بی‌خطر و بدون سرور اضافه است.
+const SUB_LINK = __SUB_LINK_JSON__;
+const SUB_NAME = __LABEL_JSON__;
+const encSub = encodeURIComponent(SUB_LINK);
+const encName = encodeURIComponent(SUB_NAME);
+const QUICK_CONNECT_APPS = [
+  {name:'V2rayNG', icon:'ti-brand-android', url:`v2rayng://install-sub?url=${encSub}&name=${encName}`},
+  {name:'Hiddify', icon:'ti-shield-check', url:`hiddify://install-sub?url=${encSub}#${encName}`},
+  {name:'Shadowrocket', icon:'ti-rocket', url:`sub://${btoa(SUB_LINK)}?remark=${encName}`},
+  {name:'Clash', icon:'ti-cloud', url:`clash://install-config?url=${encSub}`},
+  {name:'Streisand', icon:'ti-brand-apple', url:`streisand://import/${encSub}#${encName}`},
+  {name:'sing-box', icon:'ti-box', url:`sing-box://import-remote-profile?url=${encSub}#${encName}`},
+];
+const qcGrid = document.getElementById('quickConnectGrid');
+qcGrid.innerHTML = QUICK_CONNECT_APPS.map((app,i)=>
+  `<button class="qc-btn" type="button" data-qc-index="${i}"><i class="ti ${app.icon}"></i>${app.name}</button>`
+).join('');
+qcGrid.addEventListener('click', (e)=>{
+  const btn = e.target.closest('[data-qc-index]');
+  if(!btn) return;
+  const app = QUICK_CONNECT_APPS[+btn.dataset.qcIndex];
+  if(app) window.location.href = app.url;
 });
 </script>
 </body>

@@ -239,7 +239,7 @@ Client → Cloudflare Worker → Vortex Gateway → destination
 
 Worker جایگزین Gateway نیست؛ درخواست را به Origin عمومی Vortex Forward می‌کند و منطق VLESS/Authentication در Gateway باقی می‌ماند.
 
-Endpoint استقرار، Cloudflare API Token را در یک Request احراز‌هویت‌شده دریافت می‌کند، آن را validate می‌کند، Account را پیدا می‌کند، Worker یکتا می‌سازد و URL/تنظیمات آن را ذخیره می‌کند. Token در Database ذخیره نمی‌شود.
+Endpoint استقرار، Cloudflare API Token را فقط در Request احراز‌هویت‌شده دریافت می‌کند، آن را validate می‌کند و Account را پیدا می‌کند. Token در Database ذخیره نمی‌شود. Deployهای بعدی ترجیحاً همان Worker Name قبلی را به‌روزرسانی می‌کنند تا URL و لینک‌های موجود ثابت بمانند. پنل همچنین Health Check واقعی، زمان آخرین Deploy/Check، تغییر Custom Domain، غیرفعال‌سازی و حذف کامل Worker را ارائه می‌دهد.
 
 برای این قابلیت Gateway باید از اینترنت عمومی قابل دسترسی باشد؛ localhost نمی‌تواند Origin Worker باشد.
 
@@ -272,6 +272,11 @@ Endpoint استقرار، Cloudflare API Token را در یک Request احراز
 - `GET /api/connections`
 - `POST /api/notify/test`
 - `POST /api/cloudflare/deploy-worker`
+- `GET /api/cloudflare/status` — Health check واقعی Worker و آخرین Deploy/Check.
+- `POST /api/cloudflare/domains` — فهرست Custom Domainهای قابل استفاده برای Token.
+- `POST /api/cloudflare/domain` — تغییر/اتصال دامنه یا زیردامنه Worker.
+- `POST /api/cloudflare/disable-worker` — غیرفعال‌سازی دسترسی Worker بدون حذف اسکریپت.
+- `POST /api/cloudflare/delete-worker` — حذف کامل Worker و Binding دامنه.
 
 ### Links / Backup
 

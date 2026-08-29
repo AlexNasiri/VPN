@@ -16,6 +16,7 @@ import ipaddress
 import json
 import logging
 import logging.handlers
+import re
 import math
 import os
 import secrets
@@ -24,7 +25,7 @@ import sqlite3
 import time
 import uuid as uuidlib
 from collections import defaultdict, deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Literal
 from urllib.parse import quote, urlparse
 
@@ -38,7 +39,6 @@ from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerifyMismatchError
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -462,8 +462,17 @@ async def security_headers_middleware(request: Request, call_next):
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
         f"script-src 'self' 'nonce-{nonce}' https://cdnjs.cloudflare.com; "
-        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
-        "font-src 'self' https://cdn.jsdelivr.net; "
+        # FONT_LINKS (templates.py) actually loads a stylesheet from
+        # fonts.googleapis.com (Vazirmatn/JetBrains Mono), whose @font-face
+        # rules in turn point at fonts.gstatic.com for the woff2 files.
+        # style-src/font-src previously only allowed cdn.jsdelivr.net, so the
+        # browser silently blocked the Google Fonts <link> and its font
+        # files on every page (login/dashboard/sub) — text just fell back to
+        # a generic system font with no visible error besides the CSP
+        # violation in devtools. Both origins now match what is actually
+        # requested.
+        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; "
+        "font-src 'self' https://cdn.jsdelivr.net https://fonts.gstatic.com; "
         "img-src 'self' data:; "
         "connect-src 'self'; "
         "frame-ancestors 'none'"
@@ -488,7 +497,103 @@ connections_by_ip: dict[str, int] = defaultdict(int)
 # (see websocket_tunnel below, which adds/removes itself here).
 RELAY_TASKS: set = set()
 CONNECTIONS_LOCK = asyncio.Lock()
-stats = {"total_bytes": 0, "total_requests": 0, "total_errors": 0, "start_time": time.time()}
+stats = {"total_bytes": 0, "total_requests": 0, "total_errors": 0, "start_time": time.time(), "ads_blocked": 0}
+
+# ───────────────────────── Ads Blocker ─────────────────────────
+# مسدودسازی مقصدهای تبلیغاتی/ردیاب شناخته‌شده در سطح تونل VLESS، پیش از
+# resolve/connect. کاملاً از پنل مدیریت خاموش/روشن می‌شود (ذخیره در جدول
+# settings) و روی هر اتصال جدید (نه اتصالات درحال‌اجرا) اعمال می‌شود.
+# لیست پایه کوچک و متمرکز روی شبکه‌های تبلیغاتی/آنالیتیکس پراستفاده است؛
+# ادمین می‌تواند دامنه‌های دلخواه را از پنل اضافه کند.
+ADS_BLOCK_ENABLED: bool = False
+ADS_BLOCK_CUSTOM_DOMAINS: set[str] = set()
+
+_BUILTIN_AD_DOMAINS: set[str] = {
+    # --- Google / DoubleClick ad & analytics ---
+    "doubleclick.net", "googlesyndication.com", "googleadservices.com",
+    "google-analytics.com", "googletagmanager.com", "googletagservices.com",
+    "adservice.google.com", "adservice.google.co.uk", "adservice.google.de",
+    "adservice.google.fr", "pagead2.googlesyndication.com", "2mdn.net",
+    "admob.com", "admeld.com", "googleoptimize.com", "google-analytics.co",
+    "urchin.com", "adsense.com", "gads.pubmatic.com",
+    # --- Meta / Facebook ---
+    "connect.facebook.net", "an.facebook.com", "atdmt.com",
+    # --- Amazon ---
+    "amazon-adsystem.com", "aax.amazon-adsystem.com", "assoc-amazon.com",
+    # --- Microsoft / Bing / LinkedIn ads ---
+    "bat.bing.com", "ads.linkedin.com", "px.ads.linkedin.com",
+    "advertising.microsoft.com", "adnxs.net",
+    # --- TikTok / Twitter / Snap / Pinterest ads ---
+    "analytics.tiktok.com", "ads-api.tiktok.com", "ads-twitter.com",
+    "analytics.twitter.com", "sc-static.net",
+    "tr.snapchat.com", "ads.pinterest.com", "ct.pinterest.com",
+    # --- Major ad exchanges / SSPs / DSPs ---
+    "adnxs.com", "adsrvr.org", "adform.net", "adroll.com", "advertising.com",
+    "pubmatic.com", "rubiconproject.com", "openx.net", "casalemedia.com",
+    "bidswitch.net", "contextweb.com", "yieldmo.com", "sharethrough.com",
+    "media.net", "criteo.com", "criteo.net", "smartadserver.com",
+    "serving-sys.com", "adtechus.com", "yahoo-ad.net", "taboola.com",
+    "outbrain.com", "mgid.com", "revcontent.com", "adcolony.com",
+    "gumgum.com", "indexexchange.com", "improvedigital.com", "triplelift.com",
+    "33across.com", "sonobi.com", "sortable.com", "smartyads.com",
+    "adyoulike.com", "undertone.com", "districtm.io", "spotx.tv",
+    "loopme.com", "verizonmedia.com", "yieldlab.net", "ligatus.com",
+    "adpone.com", "richaudience.com", "onetag-sys.com", "connatix.com",
+    "vidoomy.com", "primis.tech", "playwire.com", "freewheel.com",
+    # --- Mobile / in-app ad SDKs ---
+    "applovin.com", "unityads.unity3d.com", "vungle.com", "ironsrc.com",
+    "chartboost.com", "smaato.com", "mopub.com", "startapp.com",
+    "inmobi.com", "adcash.com", "propellerads.com", "popads.net",
+    "exoclick.com", "adsterra.com", "bidvertiser.com", "tapjoy.com",
+    "fyber.com", "tapdaq.com", "adcolony.com", "leadbolt.com",
+    "airpush.com", "mobfox.com", "supersonicads.com", "adcash.net",
+    "yieldmo.mobi", "verve.com", "digitalturbine.com",
+    # --- Tracking / analytics / measurement / attribution ---
+    "scorecardresearch.com", "quantserve.com", "moatads.com",
+    "doubleverify.com", "adsafeprotected.com", "branch.io", "appsflyer.com",
+    "adjust.com", "kochava.com", "flurry.com", "mixpanel.com",
+    "segment.io", "hotjar.com", "crazyegg.com", "mouseflow.com",
+    "chartbeat.com", "amplitude.com", "clicktale.net", "fullstory.com",
+    "heap.io", "webengage.com", "clevertap.com", "optimizely.com",
+    "newrelic.com", "nr-data.net", "sentry.io", "bugsnag.com",
+    "onesignal.com", "pushwoosh.com", "cxense.com", "parsely.com",
+    "chartbeat.net", "krxd.net", "bluekai.com", "exelator.com",
+    "mathtag.com", "rlcdn.com", "tapad.com", "agkn.com", "eyeota.net",
+    # --- Native / popunder / redirect ad networks ---
+    "adk2.com", "spotxchange.com", "teads.tv", "innovid.com", "zedo.com",
+    "lijit.com", "sovrn.com", "popcash.net", "clickadu.com", "hilltopads.net",
+    "adsclickmedia.com", "adnium.com", "trafficjunky.com", "juicyads.com",
+    "eroadvertising.com", "propellerclick.com", "onclickmax.com",
+    "adskeeper.co.uk", "mgid.com", "content.ad", "revenuehits.com",
+    "clickaine.com", "monetizemore.com", "ezoic.net", "ezodn.com",
+    # --- Affiliate / tag-manager / consent ad-tech ---
+    "impact.com", "cj.com", "linksynergy.com", "awin1.com", "shareasale.com",
+    "rakutenmarketing.com", "flashtalking.com", "adsymptotic.com",
+    "sitescout.com", "adition.com", "adsafe.org", "trustarc.com",
+    "quantcast.com", "adroll.com", "perfectaudience.com",
+}
+
+
+def _normalize_ad_domain(domain: str) -> str:
+    return domain.strip().lower().strip(".")
+
+
+def is_ad_blocked_domain(host: str) -> bool:
+    """آیا host (یا یکی از زیردامنه‌های آن) در لیست مسدودسازی تبلیغات است.
+
+    فقط با نام‌های دامنه معنا دارد (نه IP خام). تطبیق روی suffix دامنه انجام
+    می‌شود تا مثلاً pagead2.googlesyndication.com هم زیرمجموعه‌ی
+    googlesyndication.com شناخته شود.
+    """
+    if not ADS_BLOCK_ENABLED or not host:
+        return False
+    h = host.strip().lower().strip(".")
+    if not h or h.replace(".", "").isdigit():
+        return False  # آدرس IPv4 خام؛ لیست فقط شامل نام دامنه است
+    if ":" in h:
+        return False  # IPv6 literal
+    all_domains = _BUILTIN_AD_DOMAINS | ADS_BLOCK_CUSTOM_DOMAINS
+    return any(h == d or h.endswith("." + d) for d in all_domains)
 error_logs: deque = deque(maxlen=50)
 hourly_traffic: dict = defaultdict(int)
 # مشابه hourly_traffic ولی به‌ازای هر لینک، برای نمودار مصرف اختصاصی هر لینک
@@ -673,6 +778,57 @@ def _db_delete_link_sync(uid: str):
 async def _db_delete_link(uid: str):
     async with DB_LOCK:
         await asyncio.to_thread(_db_delete_link_sync, uid)
+
+
+def _db_bulk_delete_links_sync(uids: list[str]):
+    conn = _db_connect()
+    try:
+        conn.executemany("DELETE FROM links WHERE uuid=?", [(u,) for u in uids])
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def _db_bulk_delete_links(uids: list[str]):
+    async with DB_LOCK:
+        await asyncio.to_thread(_db_bulk_delete_links_sync, uids)
+
+
+def _db_bulk_upsert_links_sync(items: list[tuple[str, dict]]):
+    # همان کوئری _db_upsert_link_sync، ولی برای چند لینک هم‌زمان با یک
+    # executemany روی یک اتصال؛ برای عملیات دسته‌ای (bulk) به‌جای باز/بستن
+    # یک اتصال SQLite جدا برای هر لینک (که برای صدها لینک کند و غیرضروری
+    # است)، همه در یک تراکنش نوشته می‌شوند.
+    conn = _db_connect()
+    try:
+        conn.executemany(
+            """INSERT INTO links (uuid, label, limit_bytes, used_bytes, created_at, active,
+                                   expires_at, speed_limit_bps, subscription_token, route_via)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(uuid) DO UPDATE SET
+                   label=excluded.label, limit_bytes=excluded.limit_bytes,
+                   used_bytes=excluded.used_bytes, created_at=excluded.created_at,
+                   active=excluded.active, expires_at=excluded.expires_at,
+                   speed_limit_bps=excluded.speed_limit_bps,
+                   subscription_token=excluded.subscription_token,
+                   route_via=excluded.route_via""",
+            [
+                (uid, data["label"], data["limit_bytes"], data["used_bytes"],
+                 data["created_at"], int(data["active"]),
+                 data.get("expires_at"), data.get("speed_limit_bps", 0),
+                 data.get("subscription_token") or secrets.token_urlsafe(32),
+                 data.get("route_via") or "auto")
+                for uid, data in items
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def _db_bulk_upsert_links(items: list[tuple[str, dict]]):
+    async with DB_LOCK:
+        await asyncio.to_thread(_db_bulk_upsert_links_sync, items)
 
 
 def _db_replace_all_links_sync(links_snapshot: dict):
@@ -1193,6 +1349,18 @@ def _db_integrity_check_sync():
     finally:
         conn.close()
 
+
+def _db_quick_ping_sync():
+    # برخلاف _db_integrity_check_sync (که PRAGMA integrity_check اجرا می‌کند
+    # و کل فایل دیتابیس را اسکن می‌کند)، این فقط تأیید می‌کند که می‌شود به
+    # دیتابیس وصل شد و یک کوئری ساده اجرا کرد — برای صدا زدن مکرر (هر
+    # درخواست health-check) طراحی شده، نه برای بررسی سلامت کامل فایل.
+    conn = _db_connect()
+    try:
+        conn.execute("SELECT 1").fetchone()
+    finally:
+        conn.close()
+
 # ───────────────────────── Startup / shutdown ─────────────────────────
 
 _cleanup_task: asyncio.Task | None = None
@@ -1252,6 +1420,14 @@ async def lifespan(_app: FastAPI):
     global http_client, _cleanup_task, _usage_flush_task, redis_client
     validate_runtime_config()
     _db_init()
+    # PRAGMA integrity_check یک اسکن کامل روی کل فایل SQLite است — جای
+    # درستش اینجاست (یک‌بار، موقع بالاآمدن)، نه توی /health/ready که هم
+    # Docker HEALTHCHECK هر ۳۰ ثانیه صدایش می‌زند هم خودِ Railway به‌طور
+    # دوره‌ای. قبلاً همان اسکن سنگین روی هر درخواست health-check اجرا
+    # می‌شد؛ با رشد دیتابیس (لینک‌ها/لاگ‌های بیشتر) این می‌توانست گاهی از
+    # timeout پنج‌ثانیه‌ای Docker/Railway بگذرد و باعث شود health-check
+    # به‌اشتباه failed اعلام شود و کانتینر بی‌دلیل ری‌استارت بخورد.
+    await asyncio.to_thread(_db_integrity_check_sync)
     # Fail fast on an unusable persistent volume instead of starting a
     # half-working gateway that silently loses control-plane state.
     storage = await asyncio.to_thread(_storage_status_sync)
@@ -1288,6 +1464,14 @@ async def lifespan(_app: FastAPI):
     settings_map = dict(setting_rows)
     ACTIVE_WORKER_URL = settings_map.get("cloudflare_worker_url", "") or ""
     await _bootstrap_admin_password(settings_map)
+
+    global ADS_BLOCK_ENABLED, ADS_BLOCK_CUSTOM_DOMAINS
+    ADS_BLOCK_ENABLED = settings_map.get("ads_block_enabled") == "1"
+    try:
+        custom_raw = json.loads(settings_map.get("ads_block_custom_domains") or "[]")
+        ADS_BLOCK_CUSTOM_DOMAINS = {_normalize_ad_domain(d) for d in custom_raw if isinstance(d, str) and d.strip()}
+    except (json.JSONDecodeError, TypeError):
+        ADS_BLOCK_CUSTOM_DOMAINS = set()
 
     scheme = "https" if cookie_secure() else "http"
     panel_host = get_host()
@@ -1623,7 +1807,10 @@ async def health_ready():
     if http_client is None:
         raise HTTPException(status_code=503, detail="service not ready")
     try:
-        await asyncio.to_thread(_db_integrity_check_sync)
+        # اسکن سنگینِ integrity_check فقط یک‌بار موقع startup اجرا می‌شود
+        # (در lifespan)؛ اینجا فقط یک پینگ سبک لازم است تا مطمئن شویم
+        # اتصال به دیتابیس هنوز برقرار و قابل‌کوئری است.
+        await asyncio.to_thread(_db_quick_ping_sync)
     except Exception:
         raise HTTPException(status_code=503, detail="database not ready")
     if CONFIG["redis_url"]:
@@ -1790,6 +1977,25 @@ def _system_status_sync() -> dict:
         db_error = str(exc)[:200]
 
     persistent = db_path == "/data" or db_path.startswith("/data" + os.sep)
+    worker_settings = _worker_settings_snapshot_sync()
+    last_code_raw = worker_settings.get("cloudflare_worker_last_status_code", "") or ""
+    try:
+        last_code = int(last_code_raw) if last_code_raw else None
+    except ValueError:
+        last_code = None
+    worker_status = {
+        "configured": bool(ACTIVE_WORKER_URL.strip()),
+        "status": worker_settings.get("cloudflare_worker_status", "not_configured"),
+        "deployed_at": worker_settings.get("cloudflare_worker_deployed_at", "") or "",
+        "last_checked_at": worker_settings.get("cloudflare_worker_last_checked_at", "") or "",
+        "last_status_code": last_code,
+        "worker_name": worker_settings.get("cloudflare_worker_name", "") or "",
+        "url": ACTIVE_WORKER_URL.strip(),
+        "domain_mode": worker_settings.get("cloudflare_worker_domain_mode", "workers_dev") or "workers_dev",
+        "hostname": worker_settings.get("cloudflare_worker_hostname", "") or "",
+        "domain_id": worker_settings.get("cloudflare_worker_domain_id", "") or "",
+        "error": worker_settings.get("cloudflare_worker_last_error", "") or "",
+    }
     return {
         "version": APP_VERSION,
         "python": f"{__import__('sys').version_info.major}.{__import__('sys').version_info.minor}.{__import__('sys').version_info.micro}",
@@ -1800,7 +2006,7 @@ def _system_status_sync() -> dict:
             "writable": os.access(db_dir, os.W_OK), "error": db_error,
         },
         "redis": {"configured": bool(CONFIG["redis_url"]), "connected": bool(redis_client is not None)},
-        "cloudflare": {"configured": bool(ACTIVE_WORKER_URL.strip())},
+        "cloudflare": worker_status,
         "backup": {"encryption_configured": bool(CONFIG["backup_encryption_key"]), "plaintext_allowed": CONFIG["allow_plaintext_backup"]},
         "telegram": {"configured": bool(CONFIG["telegram_bot_token"] and CONFIG["telegram_chat_id"])},
         "disk": {"total_bytes": disk_total, "free_bytes": disk_free, "free_percent": round((disk_free / disk_total) * 100, 1) if disk_total else None},
@@ -1887,6 +2093,74 @@ async def api_change_password(payload: ChangePasswordRequest, request: Request, 
 
 class CloudflareWorkerRequest(BaseModel):
     api_token: str = Field(default="", min_length=1, max_length=2048)
+    domain_mode: Literal["workers_dev", "custom"] = "workers_dev"
+    hostname: str = Field(default="", max_length=253)
+
+
+class CloudflareTokenRequest(BaseModel):
+    api_token: str = Field(default="", min_length=1, max_length=2048)
+
+
+class CloudflareDomainRequest(BaseModel):
+    api_token: str = Field(default="", min_length=1, max_length=2048)
+    hostname: str = Field(min_length=1, max_length=253)
+
+
+_CF_API_BASE = "https://api.cloudflare.com/client/v4"
+_LOCAL_HOSTNAMES = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+
+
+def _cf_first_error(data: dict, fallback: str = "خطای نامشخص از Cloudflare") -> tuple[int | None, str]:
+    errors = data.get("errors") or [] if isinstance(data, dict) else []
+    if errors and isinstance(errors[0], dict):
+        return errors[0].get("code"), str(errors[0].get("message") or fallback)
+    return None, fallback
+
+
+def _cf_user_error(status_code: int, data: dict, fallback: str) -> str:
+    code, msg = _cf_first_error(data, fallback)
+    text = msg.lower()
+    if status_code in (401, 403) or "permission" in text or "forbidden" in text or code in {9109, 10000}:
+        return ("Cloudflare دسترسی این عملیات را رد کرد. توکن باید دسترسی Workers Scripts Write داشته باشد؛ "
+                "برای دامنه سفارشی نیز مجوز لازم برای اتصال Domain را بدهد. " + f"جزئیات Cloudflare: {msg}")
+    if status_code == 404:
+        return f"منبع موردنظر در Cloudflare پیدا نشد. نام Worker یا Account را بررسی کن. جزئیات: {msg}"
+    return f"Cloudflare: {msg}"
+
+
+def _normalize_cf_hostname(value: str) -> str:
+    host = (value or "").strip().lower().rstrip(".")
+    if not host or len(host) > 253 or host in _LOCAL_HOSTNAMES or host.endswith(".workers.dev"):
+        return ""
+    pattern = r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}"
+    return host if re.fullmatch(pattern, host) else ""
+
+
+async def _cloudflare_json_request(client: httpx.AsyncClient, method: str, url: str, *, headers: dict, **kwargs):
+    try:
+        response = await client.request(method, url, headers=headers, **kwargs)
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="پاسخ Cloudflare دیر رسید؛ دوباره تلاش کن")
+    except httpx.HTTPError:
+        raise HTTPException(status_code=502, detail="ارتباط با Cloudflare برقرار نشد؛ اینترنت/دسترسی سرور را بررسی کن")
+    try:
+        data = response.json()
+    except ValueError:
+        data = {}
+    return response, data
+
+
+def _worker_settings_snapshot_sync() -> dict:
+    return dict(_db_get_settings_sync())
+
+
+def _save_worker_status_sync(values: dict[str, str]) -> None:
+    conn = _db_connect()
+    try:
+        conn.executemany("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", list(values.items()))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _build_cloudflare_worker_script(origin_host: str, gate: str) -> str:
@@ -1961,6 +2235,11 @@ async def api_cloudflare_deploy_worker(payload: CloudflareWorkerRequest, request
     api_token = payload.api_token.strip()
     if not api_token:
         raise HTTPException(status_code=400, detail="API Token را وارد کن")
+    normalized_hostname = ""
+    if payload.domain_mode == "custom":
+        normalized_hostname = _normalize_cf_hostname(payload.hostname)
+        if not normalized_hostname:
+            raise HTTPException(status_code=422, detail="دامنه سفارشی معتبر نیست؛ مثل relay.example.com وارد کن")
 
     # If RAILWAY_PUBLIC_DOMAIN is missing we no longer fail immediately —
     # _resolve_public_host() below falls back to the current request's Host
@@ -2023,7 +2302,16 @@ async def api_cloudflare_deploy_worker(payload: CloudflareWorkerRequest, request
             raise HTTPException(status_code=400, detail="آدرس عمومی گیت‌وی معتبر نیست")
         origin_host = parsed_origin.hostname
 
-        worker_name = f"vortex-{secrets.token_hex(4)}"
+        # NOTE: existing_settings must be loaded before it is read below.
+        # (Previously this was fetched *after* worker_name/gate already tried
+        # to read from it, which raised UnboundLocalError on every single
+        # call and made Deploy/Update Worker fail 100% of the time.)
+        async with DB_LOCK:
+            existing_settings = await asyncio.to_thread(_db_get_settings_sync)
+
+        worker_name = (existing_settings.get("cloudflare_worker_name") or "").strip()
+        if not worker_name:
+            worker_name = f"vortex-{secrets.token_hex(4)}"
         # Reuse the previously deployed gate path (if any) instead of always
         # generating a brand new one. This is the direct fix for "old
         # sub/tunnel links stop working every time I rebuild the Worker":
@@ -2033,8 +2321,6 @@ async def api_cloudflare_deploy_worker(payload: CloudflareWorkerRequest, request
         # Worker rebuild (e.g. after a Railway redeploy changed the origin
         # host) keeps existing links working; the gate only changes on the
         # very first deployment.
-        async with DB_LOCK:
-            existing_settings = await asyncio.to_thread(_db_get_settings_sync)
         gate = (existing_settings.get("cloudflare_worker_gate") or "").strip()
         if not gate or not gate.isalnum() or not (10 <= len(gate) <= 20):
             gate = secrets.token_urlsafe(18).replace("_", "").replace("-", "")[:20]
@@ -2128,11 +2414,48 @@ async def api_cloudflare_deploy_worker(payload: CloudflareWorkerRequest, request
             raise HTTPException(status_code=400, detail="Account workers.dev subdomain قابل دریافت نیست")
 
         worker_url = f"https://{worker_name}.{subdomain}.workers.dev/{gate}"
+        domain_id = ""
+        active_hostname = f"{worker_name}.{subdomain}.workers.dev"
+        active_domain_mode = "workers_dev"
+        if normalized_hostname:
+            domain_resp, domain_data = await _cloudflare_json_request(
+                client, "PUT", f"{_CF_API_BASE}/accounts/{account_id}/workers/domains",
+                headers={**headers, "Content-Type": "application/json"},
+                json={"hostname": normalized_hostname, "service": worker_name},
+            )
+            if domain_resp.status_code not in (200, 201) or not domain_data.get("success"):
+                raise HTTPException(status_code=400, detail=_cf_user_error(domain_resp.status_code, domain_data, "اتصال دامنه سفارشی ناموفق بود"))
+            result = domain_data.get("result") or {}
+            domain_id = str(result.get("id") or "")
+            active_hostname = normalized_hostname
+            active_domain_mode = "custom"
+            worker_url = f"https://{normalized_hostname}/{gate}"
+
+        # Remove a previous custom-domain binding when switching to another
+        # hostname or back to workers.dev. This prevents stale hostnames from
+        # continuing to point at the relay after the user changes the setting.
+        previous_domain_id = (existing_settings.get("cloudflare_worker_domain_id") or "").strip()
+        if previous_domain_id and previous_domain_id != domain_id:
+            old_domain_resp, old_domain_data = await _cloudflare_json_request(
+                client, "DELETE", f"{_CF_API_BASE}/accounts/{account_id}/workers/domains/{previous_domain_id}", headers=headers
+            )
+            if old_domain_resp.status_code not in (200, 204) and not old_domain_data.get("success"):
+                raise HTTPException(status_code=400, detail=_cf_user_error(old_domain_resp.status_code, old_domain_data, "دامنه قبلی حذف نشد؛ تغییر آدرس برای جلوگیری از وضعیت نیمه‌کاره متوقف شد"))
 
         # Verify the actual deployed relay before writing anything to SQLite.
+        # A freshly created workers.dev route (especially the very first one
+        # on an account, or right after creating the account-level
+        # subdomain) can take well over a few seconds to propagate across
+        # Cloudflare's edge. Retrying only 3x with a 1s gap (~3s total) was
+        # racing that propagation delay: it failed far more often than it
+        # passed, and on failure the newly created Worker was deleted,
+        # forcing a full restart (new random worker name -> propagation
+        # delay all over again) on every retry. Give it a much longer,
+        # backed-off window before giving up.
         health_url = f"{worker_url}/health/ready"
         last_status = None
-        for _attempt in range(3):
+        attempts = 12
+        for _attempt in range(attempts):
             try:
                 health_resp = await client.get(health_url, headers={"Cache-Control": "no-cache"})
                 last_status = health_resp.status_code
@@ -2140,39 +2463,267 @@ async def api_cloudflare_deploy_worker(payload: CloudflareWorkerRequest, request
                     break
             except httpx.HTTPError:
                 pass
-            await asyncio.sleep(1.0)
+            if _attempt < attempts - 1:
+                await asyncio.sleep(min(2.0 + _attempt * 0.5, 5.0))
         else:
-            with contextlib.suppress(Exception):
-                await client.delete(upload_url, headers=headers)
-            raise HTTPException(status_code=502, detail=f"Worker ساخته شد اما از بیرون قابل دسترسی نیست (status={last_status})")
+            now = datetime.now().isoformat(timespec="seconds")
+            status_text = "inactive" if last_status == 404 else "unreachable"
+            await _db_set_setting("cloudflare_worker_status", status_text)
+            await _db_set_setting("cloudflare_worker_last_checked_at", now)
+            await _db_set_setting("cloudflare_worker_last_status_code", str(last_status or ""))
+            await _db_set_setting("cloudflare_worker_last_error", f"health status={last_status}")
+            if normalized_hostname and domain_id:
+                with contextlib.suppress(Exception):
+                    await client.delete(f"{_CF_API_BASE}/accounts/{account_id}/workers/domains/{domain_id}", headers=headers)
+            raise HTTPException(status_code=502, detail=f"Worker ساخته شد ولی endpoint هنوز سالم نیست (HTTP {last_status or 'بدون پاسخ'}). چند لحظه بعد دوباره وضعیت را بررسی کن.")
 
-    # New Worker is healthy. Retire the previously active Worker to avoid
-    # accumulating unused scripts in the account. Failure to delete the old
-    # script is non-fatal because the new Worker is already known-good.
-    previous_worker_name = ""
-    try:
-        async with DB_LOCK:
-            settings_snapshot = await asyncio.to_thread(_db_get_settings_sync)
-        previous_worker_name = settings_snapshot.get("cloudflare_worker_name", "") or ""
-    except Exception:
+        # New Worker is healthy. Reusing the Worker name keeps existing URLs and
+        # custom-domain bindings stable across redeploys.
+        # accumulating unused scripts in the account. Failure to delete the
+        # old script is non-fatal because the new Worker is already
+        # known-good. NOTE: this must stay *inside* the `async with
+        # httpx.AsyncClient(...) as client:` block above — it used to sit
+        # outside it (wrong indentation), which meant `client` had already
+        # been closed by the context manager by the time this ran. Calling
+        # a closed httpx.AsyncClient raises RuntimeError, which is NOT an
+        # httpx.HTTPError, so it wasn't caught here and instead crashed the
+        # whole request with a 500 *before* the new worker_name/worker_url
+        # were ever saved to the database. That made every deploy after the
+        # first successful one fail unconditionally.
         previous_worker_name = ""
-    if previous_worker_name and previous_worker_name != worker_name:
-        previous_upload_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/workers/scripts/{previous_worker_name}"
         try:
-            cleanup_resp = await client.delete(previous_upload_url, headers=headers)
-            if cleanup_resp.status_code not in (200, 204):
-                logger.warning("Cloudflare old Worker cleanup failed name=%s status=%s", previous_worker_name, cleanup_resp.status_code)
-        except httpx.HTTPError as exc:
-            logger.warning("Cloudflare old Worker cleanup failed name=%s error=%s", previous_worker_name, exc)
+            async with DB_LOCK:
+                settings_snapshot = await asyncio.to_thread(_db_get_settings_sync)
+            previous_worker_name = settings_snapshot.get("cloudflare_worker_name", "") or ""
+        except Exception:
+            previous_worker_name = ""
+        if previous_worker_name and previous_worker_name != worker_name:
+            previous_upload_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/workers/scripts/{previous_worker_name}"
+            try:
+                cleanup_resp = await client.delete(previous_upload_url, headers=headers)
+                if cleanup_resp.status_code not in (200, 204):
+                    logger.warning("Cloudflare old Worker cleanup failed name=%s status=%s", previous_worker_name, cleanup_resp.status_code)
+            except httpx.HTTPError as exc:
+                logger.warning("Cloudflare old Worker cleanup failed name=%s error=%s", previous_worker_name, exc)
 
     global ACTIVE_WORKER_URL
     ACTIVE_WORKER_URL = worker_url
+    now = datetime.now().isoformat(timespec="seconds")
     await _db_set_setting("cloudflare_worker_name", worker_name)
     await _db_set_setting("cloudflare_worker_url", ACTIVE_WORKER_URL)
     await _db_set_setting("cloudflare_worker_gate", gate)
+    await _db_set_setting("cloudflare_worker_deployed_at", now)
+    await _db_set_setting("cloudflare_worker_last_checked_at", now)
+    await _db_set_setting("cloudflare_worker_last_status_code", "200")
+    await _db_set_setting("cloudflare_worker_status", "healthy")
+    await _db_set_setting("cloudflare_worker_last_error", "")
+    await _db_set_setting("cloudflare_worker_domain_mode", active_domain_mode)
+    await _db_set_setting("cloudflare_worker_hostname", active_hostname)
+    await _db_set_setting("cloudflare_worker_domain_id", domain_id)
 
-    logger.info("☁️ AUDIT cloudflare worker deployed name=%s ip=%s", worker_name, client_ip(request))
-    return {"ok": True, "worker_name": worker_name, "worker_url": ACTIVE_WORKER_URL, "gate": gate, "gate_reused": bool(existing_settings.get("cloudflare_worker_gate"))}
+    logger.info("☁️ AUDIT cloudflare worker deployed name=%s mode=%s host=%s ip=%s", worker_name, active_domain_mode, active_hostname, client_ip(request))
+    return {"ok": True, "worker_name": worker_name, "worker_url": ACTIVE_WORKER_URL, "gate": gate, "domain_mode": active_domain_mode, "hostname": active_hostname}
+
+
+async def _probe_active_worker() -> dict:
+    url = ACTIVE_WORKER_URL.strip().rstrip("/")
+    now = datetime.now().isoformat(timespec="seconds")
+    if not url:
+        return {"status": "not_configured", "checked_at": now, "status_code": None, "latency_ms": None, "error": "Worker هنوز تنظیم نشده است"}
+    health_url = f"{url}/health/ready"
+    started = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=4.0), follow_redirects=False) as client:
+            response = await client.get(health_url, headers={"Cache-Control": "no-cache"})
+        latency = round((time.perf_counter() - started) * 1000, 1)
+        if response.status_code == 200:
+            return {"status": "healthy", "checked_at": now, "status_code": 200, "latency_ms": latency, "error": ""}
+        if response.status_code == 404:
+            return {"status": "inactive", "checked_at": now, "status_code": 404, "latency_ms": latency, "error": "Worker endpoint در دسترس نیست یا Route/Domain غیرفعال شده است"}
+        return {"status": "degraded", "checked_at": now, "status_code": response.status_code, "latency_ms": latency, "error": f"Health check با HTTP {response.status_code} برگشت"}
+    except httpx.TimeoutException:
+        return {"status": "unreachable", "checked_at": now, "status_code": None, "latency_ms": None, "error": "پاسخ Worker در مهلت تعیین‌شده نرسید"}
+    except httpx.HTTPError as exc:
+        return {"status": "unreachable", "checked_at": now, "status_code": None, "latency_ms": None, "error": f"ارتباط با Worker برقرار نشد: {str(exc)[:120]}"}
+
+
+@app.get("/api/cloudflare/status")
+async def api_cloudflare_worker_status(_=Depends(require_auth)):
+    # When there is no active Worker URL there is nothing to probe over the
+    # network. Previously this still ran _probe_active_worker(), which always
+    # reports the generic "not_configured" status and then overwrote whatever
+    # was actually stored (e.g. "disabled" right after the admin explicitly
+    # disabled the Worker). That made "disabled" and "deleted" indistinguishable
+    # from "never configured" the moment the dashboard refreshed the status.
+    if not ACTIVE_WORKER_URL.strip():
+        settings = await asyncio.to_thread(_worker_settings_snapshot_sync)
+        return {
+            "ok": False,
+            "status": settings.get("cloudflare_worker_status", "not_configured") or "not_configured",
+            "checked_at": settings.get("cloudflare_worker_last_checked_at", "") or "",
+            "status_code": None,
+            "latency_ms": None,
+            "error": settings.get("cloudflare_worker_last_error", "") or "",
+            "configured": False,
+            "worker_name": settings.get("cloudflare_worker_name", "") or "",
+            "worker_url": "",
+            "deployed_at": settings.get("cloudflare_worker_deployed_at", "") or "",
+            "domain_mode": settings.get("cloudflare_worker_domain_mode", "workers_dev") or "workers_dev",
+            "hostname": settings.get("cloudflare_worker_hostname", "") or "",
+        }
+    result = await _probe_active_worker()
+    await asyncio.to_thread(_save_worker_status_sync, {
+        "cloudflare_worker_status": result["status"],
+        "cloudflare_worker_last_checked_at": result["checked_at"],
+        "cloudflare_worker_last_status_code": str(result.get("status_code") or ""),
+        "cloudflare_worker_last_error": result.get("error", ""),
+    })
+    settings = await asyncio.to_thread(_worker_settings_snapshot_sync)
+    return {
+        "ok": result["status"] == "healthy",
+        **result,
+        "configured": bool(ACTIVE_WORKER_URL.strip()),
+        "worker_name": settings.get("cloudflare_worker_name", "") or "",
+        "worker_url": ACTIVE_WORKER_URL.strip(),
+        "deployed_at": settings.get("cloudflare_worker_deployed_at", "") or "",
+        "domain_mode": settings.get("cloudflare_worker_domain_mode", "workers_dev") or "workers_dev",
+        "hostname": settings.get("cloudflare_worker_hostname", "") or "",
+    }
+
+
+@app.post("/api/cloudflare/domains")
+async def api_cloudflare_domains(payload: CloudflareTokenRequest, _=Depends(require_auth_csrf)):
+    headers = {"Authorization": f"Bearer {payload.api_token.strip()}"}
+    async with httpx.AsyncClient(timeout=20) as client:
+        verify_resp, verify_data = await _cloudflare_json_request(client, "GET", f"{_CF_API_BASE}/user/tokens/verify", headers=headers)
+        if verify_resp.status_code != 200 or not verify_data.get("success"):
+            raise HTTPException(status_code=400, detail="توکن Cloudflare نامعتبر یا منقضی است؛ یک API Token جدید بساز")
+        accounts_resp, accounts_data = await _cloudflare_json_request(client, "GET", f"{_CF_API_BASE}/accounts", headers=headers, params={"page": 1, "per_page": 100})
+        if accounts_resp.status_code != 200 or not accounts_data.get("success"):
+            raise HTTPException(status_code=accounts_resp.status_code, detail=_cf_user_error(accounts_resp.status_code, accounts_data, "خواندن Accountهای Cloudflare ناموفق بود"))
+        accounts = [x for x in (accounts_data.get("result") or []) if x.get("id")]
+        if not accounts:
+            raise HTTPException(status_code=400, detail="این Token به هیچ Cloudflare Account قابل استفاده‌ای دسترسی ندارد")
+        account_id = accounts[0]["id"]
+        domains_resp, domains_data = await _cloudflare_json_request(client, "GET", f"{_CF_API_BASE}/accounts/{account_id}/workers/domains", headers=headers, params={"page": 1, "per_page": 100})
+        if domains_resp.status_code != 200 or not domains_data.get("success"):
+            raise HTTPException(status_code=domains_resp.status_code, detail=_cf_user_error(domains_resp.status_code, domains_data, "خواندن دامنه‌های Worker ناموفق بود"))
+        domains = [{"id": x.get("id", ""), "hostname": x.get("hostname", ""), "service": x.get("service", ""), "zone_name": x.get("zone_name", "")} for x in (domains_data.get("result") or [])]
+        return {"ok": True, "domains": domains}
+
+
+@app.post("/api/cloudflare/domain")
+async def api_cloudflare_set_domain(payload: CloudflareDomainRequest, request: Request, _=Depends(require_auth_csrf)):
+    hostname = _normalize_cf_hostname(payload.hostname)
+    if not hostname:
+        raise HTTPException(status_code=422, detail="دامنه معتبر نیست؛ مثل relay.example.com وارد کن")
+    settings = await asyncio.to_thread(_worker_settings_snapshot_sync)
+    worker_name = (settings.get("cloudflare_worker_name") or "").strip()
+    gate = (settings.get("cloudflare_worker_gate") or "").strip()
+    if not worker_name or not gate:
+        raise HTTPException(status_code=409, detail="اول Worker را بساز، بعد دامنه را تغییر بده")
+    headers = {"Authorization": f"Bearer {payload.api_token.strip()}"}
+    async with httpx.AsyncClient(timeout=20) as client:
+        verify_resp, verify_data = await _cloudflare_json_request(client, "GET", f"{_CF_API_BASE}/user/tokens/verify", headers=headers)
+        if verify_resp.status_code != 200 or not verify_data.get("success"):
+            raise HTTPException(status_code=400, detail="توکن Cloudflare نامعتبر یا منقضی است")
+        accounts_resp, accounts_data = await _cloudflare_json_request(client, "GET", f"{_CF_API_BASE}/accounts", headers=headers, params={"page": 1, "per_page": 100})
+        if accounts_resp.status_code != 200 or not accounts_data.get("success"):
+            raise HTTPException(status_code=accounts_resp.status_code, detail=_cf_user_error(accounts_resp.status_code, accounts_data, "خواندن Account ناموفق بود"))
+        accounts = [x for x in (accounts_data.get("result") or []) if x.get("id")]
+        if not accounts:
+            raise HTTPException(status_code=400, detail="Account قابل استفاده‌ای پیدا نشد")
+        account_id = accounts[0]["id"]
+        attach_resp, attach_data = await _cloudflare_json_request(client, "PUT", f"{_CF_API_BASE}/accounts/{account_id}/workers/domains", headers={**headers, "Content-Type": "application/json"}, json={"hostname": hostname, "service": worker_name})
+        if attach_resp.status_code not in (200, 201) or not attach_data.get("success"):
+            raise HTTPException(status_code=400, detail=_cf_user_error(attach_resp.status_code, attach_data, "اتصال دامنه به Worker ناموفق بود"))
+        new_id = str((attach_data.get("result") or {}).get("id") or "")
+        old_id = (settings.get("cloudflare_worker_domain_id") or "").strip()
+        if old_id and old_id != new_id:
+            old_resp, old_data = await _cloudflare_json_request(client, "DELETE", f"{_CF_API_BASE}/accounts/{account_id}/workers/domains/{old_id}", headers=headers)
+            if old_resp.status_code not in (200, 204) and not old_data.get("success"):
+                with contextlib.suppress(Exception):
+                    await client.delete(f"{_CF_API_BASE}/accounts/{account_id}/workers/domains/{new_id}", headers=headers)
+                raise HTTPException(status_code=400, detail=_cf_user_error(old_resp.status_code, old_data, "دامنه قبلی حذف نشد؛ برای جلوگیری از اتصال هم‌زمان دو دامنه، تغییر لغو شد"))
+    global ACTIVE_WORKER_URL
+    ACTIVE_WORKER_URL = f"https://{hostname}/{gate}"
+    await _db_set_setting("cloudflare_worker_url", ACTIVE_WORKER_URL)
+    await _db_set_setting("cloudflare_worker_domain_mode", "custom")
+    await _db_set_setting("cloudflare_worker_hostname", hostname)
+    await _db_set_setting("cloudflare_worker_domain_id", new_id)
+    await audit("cloudflare_worker_domain_changed", client_ip(request), f"hostname={hostname}")
+    return {"ok": True, "worker_url": ACTIVE_WORKER_URL, "hostname": hostname, "domain_id": new_id}
+
+
+async def _cloudflare_account_id(client: httpx.AsyncClient, headers: dict) -> str:
+    response, data = await _cloudflare_json_request(client, "GET", f"{_CF_API_BASE}/accounts", headers=headers, params={"page": 1, "per_page": 100})
+    if response.status_code != 200 or not data.get("success"):
+        raise HTTPException(status_code=response.status_code, detail=_cf_user_error(response.status_code, data, "خواندن Accountهای Cloudflare ناموفق بود"))
+    accounts = [x for x in (data.get("result") or []) if x.get("id")]
+    if not accounts:
+        raise HTTPException(status_code=400, detail="Token به هیچ Cloudflare Account قابل استفاده‌ای دسترسی ندارد")
+    return accounts[0]["id"]
+
+
+@app.post("/api/cloudflare/disable-worker")
+async def api_cloudflare_disable_worker(payload: CloudflareTokenRequest, request: Request, _=Depends(require_auth_csrf)):
+    settings = await asyncio.to_thread(_worker_settings_snapshot_sync)
+    worker_name = (settings.get("cloudflare_worker_name") or "").strip()
+    if not worker_name:
+        raise HTTPException(status_code=409, detail="Worker ثبت‌شده‌ای برای غیرفعال‌سازی وجود ندارد")
+    headers = {"Authorization": f"Bearer {payload.api_token.strip()}"}
+    async with httpx.AsyncClient(timeout=20) as client:
+        verify_resp, verify_data = await _cloudflare_json_request(client, "GET", f"{_CF_API_BASE}/user/tokens/verify", headers=headers)
+        if verify_resp.status_code != 200 or not verify_data.get("success"):
+            raise HTTPException(status_code=400, detail="توکن Cloudflare نامعتبر یا منقضی است")
+        account_id = await _cloudflare_account_id(client, headers)
+        failures = []
+        domain_id = (settings.get("cloudflare_worker_domain_id") or "").strip()
+        if domain_id:
+            resp, data = await _cloudflare_json_request(client, "DELETE", f"{_CF_API_BASE}/accounts/{account_id}/workers/domains/{domain_id}", headers=headers)
+            if resp.status_code not in (200, 204) and not data.get("success"):
+                failures.append(_cf_user_error(resp.status_code, data, "غیرفعال‌سازی دامنه ناموفق بود"))
+        resp, data = await _cloudflare_json_request(client, "DELETE", f"{_CF_API_BASE}/accounts/{account_id}/workers/scripts/{worker_name}/subdomain", headers=headers)
+        if resp.status_code not in (200, 204) and not data.get("success"):
+            failures.append(_cf_user_error(resp.status_code, data, "غیرفعال‌سازی workers.dev ناموفق بود"))
+    if failures:
+        raise HTTPException(status_code=400, detail=" | ".join(failures))
+    global ACTIVE_WORKER_URL
+    ACTIVE_WORKER_URL = ""
+    now = datetime.now().isoformat(timespec="seconds")
+    for key, value in {"cloudflare_worker_url":"", "cloudflare_worker_status":"disabled", "cloudflare_worker_last_checked_at":now, "cloudflare_worker_last_status_code":"404", "cloudflare_worker_domain_mode":"disabled", "cloudflare_worker_domain_id":"", "cloudflare_worker_last_error":"Worker توسط پنل غیرفعال شد"}.items():
+        await _db_set_setting(key, value)
+    await audit("cloudflare_worker_disabled", client_ip(request), f"worker={worker_name}")
+    return {"ok": True, "status": "disabled"}
+
+
+@app.post("/api/cloudflare/delete-worker")
+async def api_cloudflare_delete_worker(payload: CloudflareTokenRequest, request: Request, _=Depends(require_auth_csrf)):
+    settings = await asyncio.to_thread(_worker_settings_snapshot_sync)
+    worker_name = (settings.get("cloudflare_worker_name") or "").strip()
+    if not worker_name:
+        raise HTTPException(status_code=409, detail="Worker ثبت‌شده‌ای برای حذف وجود ندارد")
+    headers = {"Authorization": f"Bearer {payload.api_token.strip()}"}
+    async with httpx.AsyncClient(timeout=20) as client:
+        verify_resp, verify_data = await _cloudflare_json_request(client, "GET", f"{_CF_API_BASE}/user/tokens/verify", headers=headers)
+        if verify_resp.status_code != 200 or not verify_data.get("success"):
+            raise HTTPException(status_code=400, detail="توکن Cloudflare نامعتبر یا منقضی است")
+        account_id = await _cloudflare_account_id(client, headers)
+        domain_id = (settings.get("cloudflare_worker_domain_id") or "").strip()
+        if domain_id:
+            resp, data = await _cloudflare_json_request(client, "DELETE", f"{_CF_API_BASE}/accounts/{account_id}/workers/domains/{domain_id}", headers=headers)
+            if resp.status_code not in (200, 204) and not data.get("success"):
+                raise HTTPException(status_code=400, detail=_cf_user_error(resp.status_code, data, "دامنه قبل از حذف Worker برداشته نشد"))
+        resp, data = await _cloudflare_json_request(client, "DELETE", f"{_CF_API_BASE}/accounts/{account_id}/workers/scripts/{worker_name}", headers=headers)
+        if resp.status_code not in (200, 204) and not data.get("success", False):
+            raise HTTPException(status_code=resp.status_code, detail=_cf_user_error(resp.status_code, data, "حذف Worker ناموفق بود"))
+    global ACTIVE_WORKER_URL
+    ACTIVE_WORKER_URL = ""
+    now = datetime.now().isoformat(timespec="seconds")
+    for key, value in {"cloudflare_worker_name":"", "cloudflare_worker_url":"", "cloudflare_worker_gate":"", "cloudflare_worker_status":"deleted", "cloudflare_worker_last_status_code":"404", "cloudflare_worker_last_checked_at":now, "cloudflare_worker_domain_mode":"deleted", "cloudflare_worker_hostname":"", "cloudflare_worker_domain_id":"", "cloudflare_worker_last_error":"Worker حذف شد"}.items():
+        await _db_set_setting(key, value)
+    await audit("cloudflare_worker_deleted", client_ip(request), f"worker={worker_name}")
+    return {"ok": True, "status": "deleted"}
 
 
 # ───────────────────────── Stats ─────────────────────────
@@ -2190,6 +2741,55 @@ async def get_stats(_=Depends(require_auth)):
         "recent_errors": list(error_logs)[-10:],
         "links_count": len(LINKS),
         "telegram_configured": bool(CONFIG["telegram_bot_token"] and CONFIG["telegram_chat_id"]),
+        "ads_block_enabled": ADS_BLOCK_ENABLED,
+        "ads_blocked_count": stats["ads_blocked"],
+    }
+
+
+# ───────────────────────── Ads Blocker settings ─────────────────────────
+
+class AdsBlockSettingsRequest(BaseModel):
+    enabled: bool
+    custom_domains: list[str] | None = None
+
+
+@app.get("/api/settings/ads-block")
+async def api_get_ads_block(_=Depends(require_auth)):
+    return {
+        "enabled": ADS_BLOCK_ENABLED,
+        "custom_domains": sorted(ADS_BLOCK_CUSTOM_DOMAINS),
+        "builtin_count": len(_BUILTIN_AD_DOMAINS),
+        "blocked_count": stats["ads_blocked"],
+    }
+
+
+@app.post("/api/settings/ads-block")
+async def api_set_ads_block(payload: AdsBlockSettingsRequest, request: Request, _=Depends(require_auth_csrf)):
+    global ADS_BLOCK_ENABLED, ADS_BLOCK_CUSTOM_DOMAINS
+
+    if payload.custom_domains is not None:
+        if len(payload.custom_domains) > 500:
+            raise HTTPException(status_code=422, detail="حداکثر ۵۰۰ دامنه سفارشی مجاز است")
+        cleaned = set()
+        for raw in payload.custom_domains:
+            if not isinstance(raw, str):
+                continue
+            d = _normalize_ad_domain(raw)
+            if not d or len(d) > 253 or " " in d:
+                continue
+            cleaned.add(d)
+        ADS_BLOCK_CUSTOM_DOMAINS = cleaned
+        await _db_set_setting("ads_block_custom_domains", json.dumps(sorted(ADS_BLOCK_CUSTOM_DOMAINS)))
+
+    ADS_BLOCK_ENABLED = bool(payload.enabled)
+    await _db_set_setting("ads_block_enabled", "1" if ADS_BLOCK_ENABLED else "0")
+    await audit("ads_block_toggle", client_ip(request), f"enabled={ADS_BLOCK_ENABLED}")
+
+    return {
+        "enabled": ADS_BLOCK_ENABLED,
+        "custom_domains": sorted(ADS_BLOCK_CUSTOM_DOMAINS),
+        "builtin_count": len(_BUILTIN_AD_DOMAINS),
+        "blocked_count": stats["ads_blocked"],
     }
 
 
@@ -2429,9 +3029,99 @@ async def delete_link(uid: str, request: Request, _=Depends(require_auth_csrf)):
         _dirty_usage_uids.discard(uid)
     _notified_pct.pop(uid, None)
     link_hourly_traffic.pop(uid, None)
+    _rate_limiters.pop(uid, None)
     logger.info("🗑️ AUDIT link deleted uid=%s ip=%s", uid[:8], client_ip(request))
     asyncio.create_task(audit("link_deleted", client_ip(request), f"uid={uid}"))
     return {"ok": True}
+
+
+BulkLinkActionName = Literal["delete", "reset", "activate", "deactivate", "extend30"]
+MAX_BULK_LINK_ACTION_UIDS = 500
+
+
+class BulkLinkActionRequest(BaseModel):
+    uids: list[str] = Field(default_factory=list)
+    action: BulkLinkActionName
+
+
+@app.post("/api/links/bulk")
+async def bulk_link_action(payload: BulkLinkActionRequest, request: Request, _=Depends(require_auth_csrf)):
+    """اجرای یک عملیات روی چند لینک هم‌زمان (برای جدول لینک‌های داشبورد وقتی
+    چند ردیف تیک خورده باشند): حذف، بازنشانی مصرف، فعال/غیرفعال‌سازی، یا
+    تمدید ۳۰ روزه‌ی انقضا. به‌جای صدها درخواست PATCH/DELETE جداگانه از سمت
+    کلاینت (که هم کند است و هم لاگ حسابرسی را شلوغ می‌کند)، همه در یک درخواست
+    و یک نوشتن دسته‌ای (batched) روی SQLite انجام می‌شود."""
+    # uids تکراری را حذف کن ولی ترتیب اصلی را نگه دار (برای پیام خطا/لاگ خواناتر).
+    seen_uids: set[str] = set()
+    uids: list[str] = []
+    for u in payload.uids:
+        if isinstance(u, str) and u and u not in seen_uids:
+            seen_uids.add(u)
+            uids.append(u)
+    if not uids:
+        raise HTTPException(status_code=400, detail="هیچ لینکی انتخاب نشده")
+    if len(uids) > MAX_BULK_LINK_ACTION_UIDS:
+        raise HTTPException(status_code=400, detail=f"حداکثر {MAX_BULK_LINK_ACTION_UIDS} لینک در هر درخواست")
+
+    affected: list[str] = []
+    missing: list[str] = []
+    now = datetime.now()
+
+    async with LINKS_LOCK:
+        if payload.action == "delete":
+            to_delete = [uid for uid in uids if uid in LINKS]
+            missing = [uid for uid in uids if uid not in LINKS]
+            if to_delete:
+                await _db_bulk_delete_links(to_delete)
+                for uid in to_delete:
+                    removed = LINKS.pop(uid, None)
+                    token = (removed or {}).get("subscription_token")
+                    if token:
+                        SUBSCRIPTION_INDEX.pop(token, None)
+                    _dirty_usage_uids.discard(uid)
+                    _notified_pct.pop(uid, None)
+                    link_hourly_traffic.pop(uid, None)
+                    _rate_limiters.pop(uid, None)
+                affected = to_delete
+        else:
+            to_write: list[tuple[str, dict]] = []
+            for uid in uids:
+                current = LINKS.get(uid)
+                if current is None:
+                    missing.append(uid)
+                    continue
+                updated = dict(current)
+                if payload.action == "reset":
+                    updated["used_bytes"] = 0
+                    _notified_pct.pop(uid, None)
+                elif payload.action == "activate":
+                    updated["active"] = True
+                elif payload.action == "deactivate":
+                    updated["active"] = False
+                elif payload.action == "extend30":
+                    base = now
+                    current_exp = updated.get("expires_at")
+                    if current_exp:
+                        try:
+                            parsed = datetime.fromisoformat(current_exp)
+                            if parsed > base:
+                                base = parsed
+                        except ValueError:
+                            pass
+                    updated["expires_at"] = (base + timedelta(days=30)).isoformat()
+                to_write.append((uid, updated))
+            if to_write:
+                await _db_bulk_upsert_links(to_write)
+                for uid, updated in to_write:
+                    LINKS[uid] = updated
+                affected = [uid for uid, _ in to_write]
+
+    logger.info(
+        "🧰 AUDIT links bulk action=%s affected=%d missing=%d ip=%s",
+        payload.action, len(affected), len(missing), client_ip(request),
+    )
+    asyncio.create_task(audit("links_bulk_action", client_ip(request), f"action={payload.action} affected={len(affected)}"))
+    return {"ok": True, "affected": len(affected), "missing": missing}
 
 
 # ───────────────────────── Backup / Restore (manual) ─────────────────────────
@@ -2619,6 +3309,7 @@ async def restore_backup(request: Request, _=Depends(require_auth_csrf)):
 
     _notified_pct.clear()
     link_hourly_traffic.clear()
+    _rate_limiters.clear()
     asyncio.create_task(audit("backup_restore", client_ip(request), f"links={len(new_links)} password_restored={restored_password}"))
     logger.info("♻️ AUDIT backup restored: %d links, password_restored=%s, ip=%s", len(new_links), restored_password, client_ip(request))
     return {"ok": True, "restored_links": len(new_links), "restored_password": restored_password}
@@ -2668,8 +3359,8 @@ async def parse_vless_header(chunk: bytes, expected_uuid: str | None = None):
     _need(chunk, pos, 1, "command")
     command = chunk[pos]
     pos += 1
-    if command != 1:
-        raise ValueError("only TCP VLESS command is supported")
+    if command not in (1, 2):
+        raise ValueError(f"unsupported VLESS command: {command}")
 
     _need(chunk, pos, 2, "port")
     port = int.from_bytes(chunk[pos:pos + 2], "big")
@@ -2715,7 +3406,7 @@ async def parse_vless_header(chunk: bytes, expected_uuid: str | None = None):
 
     if not address:
         raise ValueError("empty destination address")
-    return address, port, chunk[pos:]
+    return address, port, chunk[pos:], command
 
 
 async def receive_vless_initial(websocket: WebSocket, expected_uuid: str, max_bytes: int, timeout: float = 15.0):
@@ -2856,6 +3547,90 @@ async def downstream_to_client(ws: WebSocket, reader: asyncio.StreamReader, conn
     except Exception:
         pass
 
+
+
+class _UdpRelayProtocol(asyncio.DatagramProtocol):
+    """Receives UDP datagrams back from the destination and queues them for
+    relay to the WebSocket client. Kept intentionally dumb (no parsing) —
+    ordering/loss semantics of UDP are preserved as-is."""
+
+    def __init__(self, queue: "asyncio.Queue[bytes]"):
+        self.queue = queue
+        self.transport: asyncio.DatagramTransport | None = None
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.transport = transport  # type: ignore[assignment]
+
+    def datagram_received(self, data: bytes, addr) -> None:
+        try:
+            self.queue.put_nowait(data)
+        except asyncio.QueueFull:
+            pass  # UDP is loss-tolerant; drop under backpressure rather than block
+
+    def error_received(self, exc: Exception) -> None:
+        logger.warning("udp relay socket error: %s", exc)
+
+
+async def upstream_udp_to_target(
+    ws: WebSocket, transport: asyncio.DatagramTransport, conn_id: str, link_uid: str, initial: bytes,
+):
+    """Reads VLESS-framed UDP packets (2-byte big-endian length + payload,
+    possibly several per WebSocket message, possibly split across messages)
+    and forwards each individual datagram to the UDP destination."""
+    buffer = bytearray(initial)
+    try:
+        while True:
+            while len(buffer) >= 2:
+                plen = int.from_bytes(buffer[:2], "big")
+                if len(buffer) < 2 + plen:
+                    break
+                packet = bytes(buffer[2:2 + plen])
+                del buffer[:2 + plen]
+                if packet:
+                    ok, speed_limit_bps = await reserve_usage(link_uid, len(packet))
+                    if not ok:
+                        await ws.close(code=1008, reason="quota exceeded")
+                        return
+                    _track(link_uid, conn_id, len(packet))
+                    await throttle(link_uid, speed_limit_bps, len(packet))
+                    transport.sendto(packet)
+            msg = await ws.receive()
+            if msg["type"] == "websocket.disconnect":
+                break
+            data = msg.get("bytes") or (msg.get("text", "").encode() if msg.get("text") else None)
+            if not data:
+                continue
+            if len(buffer) + len(data) > CONFIG["max_ws_initial_bytes"] * 4:
+                # Sanity bound: a client that never sends complete length-prefixed
+                # frames must not be allowed to grow this buffer unboundedly.
+                raise ValueError("udp relay buffer overflow")
+            buffer.extend(data)
+    except WebSocketDisconnect:
+        pass
+
+
+async def downstream_udp_to_client(ws: WebSocket, queue: "asyncio.Queue[bytes]", conn_id: str, link_uid: str):
+    """Wraps each UDP response datagram with the VLESS length-prefix framing
+    and relays it to the client, prefixing the VLESS response header (2 zero
+    bytes: version + empty addons) onto the very first frame, matching the
+    TCP path in downstream_to_client."""
+    first = True
+    try:
+        while True:
+            data = await queue.get()
+            ok, speed_limit_bps = await reserve_usage(link_uid, len(data))
+            if not ok:
+                await ws.close(code=1008, reason="quota exceeded")
+                break
+            _track(link_uid, conn_id, len(data))
+            await throttle(link_uid, speed_limit_bps, len(data))
+            framed = len(data).to_bytes(2, "big") + data
+            if first:
+                framed = b"\x00\x00" + framed
+                first = False
+            await ws.send_bytes(framed)
+    except Exception:
+        pass
 
 
 async def try_acquire_ip_slot(ip: str) -> bool:
@@ -3007,16 +3782,27 @@ async def _websocket_tunnel_impl(websocket: WebSocket, uid: str):
     if current_task is not None:
         RELAY_TASKS.add(current_task)
     writer = None
+    udp_transport = None
     try:
         if not await check_quota(uid, 0):
             await websocket.close(code=1008, reason="quota exceeded or link disabled")
             return
-        address, port, initial_payload = await receive_vless_initial(
+        address, port, initial_payload, command = await receive_vless_initial(
             websocket,
             expected_uuid=uid,
             max_bytes=CONFIG["max_ws_initial_bytes"],
             timeout=15.0,
         )
+
+        # ادز بلاکر: قبل از هر resolve/connect، اگر مقصد در لیست دامنه‌های
+        # تبلیغاتی/ردیاب باشد و قابلیت از پنل فعال شده باشد، اتصال بدون
+        # صرف هیچ منبعی (DNS/TCP) بسته می‌شود. این کار هم پهنای‌باند و هم
+        # زمان کلاینت را برای مقصدهایی که چیزی جز تبلیغ/ردیابی نیستند صرفه‌جویی می‌کند.
+        if is_ad_blocked_domain(address):
+            stats["ads_blocked"] += 1
+            logger.info("🚫 [%s] ad-blocked destination %s:%s", conn_id, address, port)
+            await websocket.close(code=1000, reason="destination blocked by ads blocker")
+            return
 
         # محافظت SSRF: قبلاً این بررسی فقط برای HTTP Proxy انجام می‌شد، اما
         # تونل VLESS هم یک راه مستقیم برای اتصال به هر IP:port دلخواه است.
@@ -3031,44 +3817,80 @@ async def _websocket_tunnel_impl(websocket: WebSocket, uid: str):
         if not safe_ips:
             raise ValueError(f"blocked/unresolvable destination: {address}:{port}")
 
-        # Count only application payload, not the VLESS framing/header.
-        if initial_payload:
-            ok, speed_limit_bps = await reserve_usage(uid, len(initial_payload))
-            if not ok:
-                await websocket.close(code=1008, reason="quota exceeded")
-                return
-            _track(uid, conn_id, len(initial_payload))
-            await throttle(uid, speed_limit_bps, len(initial_payload))
-        logger.info("➡️  [%s] CONNECT %s:%s candidates=%s", conn_id, address, port, len(safe_ips))
+        proto_label = "UDP" if command == 2 else "TCP"
+        logger.info("➡️  [%s] CONNECT(%s) %s:%s candidates=%s", conn_id, proto_label, address, port, len(safe_ips))
 
-        last_connect_error = None
-        for safe_ip in safe_ips:
-            try:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(safe_ip, port), timeout=10.0
-                )
-                logger.info("✅ [%s] connected via %s:%s", conn_id, safe_ip, port)
-                break
-            except (OSError, asyncio.TimeoutError) as exc:
-                last_connect_error = exc
-                logger.warning("⚠️ [%s] connect failed via %s:%s: %s: %s", conn_id, safe_ip, port, type(exc).__name__, exc)
+        if command == 2:
+            # UDP relay: هر پکت به‌طور جداگانه با DNS-rebinding-safe IP که
+            # قبلاً resolve شده مرتبط می‌شود. initial_payload اینجا داده‌ی
+            # خامِ آزاد نیست، بلکه طبق پروتکل VLESS به‌صورت
+            # [2-byte length][packet] فریم شده — به همین دلیل برخلاف مسیر
+            # TCP، اینجا آن را زودتر با reserve_usage عمومی نمی‌شماریم؛
+            # upstream_udp_to_target خودش هر پکت را جدا می‌کند و جداگانه
+            # سهمیه/throttle آن را اعمال می‌کند.
+            safe_ip = safe_ips[0]
+            loop = asyncio.get_running_loop()
+            udp_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=1024)
+            udp_transport, _protocol = await loop.create_datagram_endpoint(
+                lambda: _UdpRelayProtocol(udp_queue),
+                remote_addr=(safe_ip, port),
+            )
+            logger.info("✅ [%s] udp relay bound via %s:%s", conn_id, safe_ip, port)
+
+            up = asyncio.create_task(
+                upstream_udp_to_target(websocket, udp_transport, conn_id, uid, initial_payload),
+                name=f"vortex-udp-up-{conn_id}",
+            )
+            down = asyncio.create_task(
+                downstream_udp_to_client(websocket, udp_queue, conn_id, uid),
+                name=f"vortex-udp-down-{conn_id}",
+            )
+            done, pending = await asyncio.wait({up, down}, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            for task in done:
+                with contextlib.suppress(Exception):
+                    task.result()
         else:
-            raise last_connect_error or ConnectionError(f"unable to connect to {address}:{port}")
-        _tune_socket(writer)
-        if initial_payload:
-            writer.write(initial_payload)
-            await writer.drain()
+            # Count only application payload, not the VLESS framing/header.
+            if initial_payload:
+                ok, speed_limit_bps = await reserve_usage(uid, len(initial_payload))
+                if not ok:
+                    await websocket.close(code=1008, reason="quota exceeded")
+                    return
+                _track(uid, conn_id, len(initial_payload))
+                await throttle(uid, speed_limit_bps, len(initial_payload))
 
-        up = asyncio.create_task(upstream_to_client(websocket, writer, conn_id, uid), name=f"vortex-up-{conn_id}")
-        down = asyncio.create_task(downstream_to_client(websocket, reader, conn_id, uid), name=f"vortex-down-{conn_id}")
-        done, pending = await asyncio.wait({up, down}, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        for task in done:
-            with contextlib.suppress(Exception):
-                task.result()
+            last_connect_error = None
+            for safe_ip in safe_ips:
+                try:
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection(safe_ip, port), timeout=10.0
+                    )
+                    logger.info("✅ [%s] connected via %s:%s", conn_id, safe_ip, port)
+                    break
+                except (OSError, asyncio.TimeoutError) as exc:
+                    last_connect_error = exc
+                    logger.warning("⚠️ [%s] connect failed via %s:%s: %s: %s", conn_id, safe_ip, port, type(exc).__name__, exc)
+            else:
+                raise last_connect_error or ConnectionError(f"unable to connect to {address}:{port}")
+            _tune_socket(writer)
+            if initial_payload:
+                writer.write(initial_payload)
+                await writer.drain()
+
+            up = asyncio.create_task(upstream_to_client(websocket, writer, conn_id, uid), name=f"vortex-up-{conn_id}")
+            down = asyncio.create_task(downstream_to_client(websocket, reader, conn_id, uid), name=f"vortex-down-{conn_id}")
+            done, pending = await asyncio.wait({up, down}, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            for task in done:
+                with contextlib.suppress(Exception):
+                    task.result()
     except WebSocketDisconnect:
         pass
     except Exception as exc:
@@ -3079,6 +3901,11 @@ async def _websocket_tunnel_impl(websocket: WebSocket, uid: str):
         if writer:
             try:
                 writer.close()
+            except Exception:
+                pass
+        if udp_transport:
+            try:
+                udp_transport.close()
             except Exception:
                 pass
         connections.pop(conn_id, None)
@@ -3350,6 +4177,7 @@ async def subscription_page(token: str, request: Request):
         .replace("__VLESS_LINK_TEXT__", html.escape(vless_link))
         .replace("__VLESS_LINK_JSON__", json.dumps(vless_link))
         .replace("__SUB_LINK_JSON__", json.dumps(sub_link))
+        .replace("__LABEL_JSON__", json.dumps(snapshot["label"]))
     )
     return HTMLResponse(content=_with_csp_nonce(page, request.state.csp_nonce))
 
