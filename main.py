@@ -1,1290 +1,289 @@
-"""
-Vortex Gateway
-یک گیت‌وی تونل‌زنی VLESS روی WebSocket به همراه HTTP Proxy امن‌شده و
-داشبورد مدیریتی. طراحی و پیاده‌سازی مستقل، بدون کپی از پروژه‌های مشابه.
-"""
+import subprocess
+import sys
+
+_PACKAGES = [
+    "fastapi==0.104.1",
+    "uvicorn[standard]==0.24.0",
+    "uvloop>=0.19.0",
+    "httptools>=0.6.0",
+    "httpx[http2]==0.25.1",
+    "websockets==12.0",
+    "aiofiles>=23.2.1",
+    "cryptography>=39.0.0",
+    "psutil>=5.9.0",
+]
+
+def _install_packages():
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", *_PACKAGES],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"[STARTUP] خطا در نصب پکیج‌ها:\n{e.stderr.decode()}", file=sys.stderr)
+        sys.exit(1)
+
+# _install_packages()  # deps preinstalled for local test
 
 import asyncio
-import inspect
-import glob
-import contextlib
-import base64
-import hashlib
-import hmac
-import html
-import ipaddress
 import json
-import logging
-import logging.handlers
-import re
-import math
 import os
+import hashlib
 import secrets
-import socket
-import sqlite3
+import sys
 import time
-import uuid as uuidlib
-from collections import defaultdict, deque
+import traceback
+import central
+import aiofiles
 from datetime import datetime, timedelta
-from typing import Literal
-from urllib.parse import quote, urlparse
-
-import httpx
-try:
-    import redis.asyncio as redis_async
-except ImportError:  # optional distributed state backend
-    redis_async = None
-from cryptography.fernet import Fernet, InvalidToken
-from argon2 import PasswordHasher
-from argon2.exceptions import InvalidHashError, VerifyMismatchError
+from zoneinfo import ZoneInfo
+from urllib.parse import quote
+from collections import deque, defaultdict
+from pathlib import Path
+import bottokentcpproxy
+from protocol.mtproto import mtproto_native as mtproto
+from typing import Optional
+import base64
+import botgeneratedomin
+import bottokentcpproxy
+import zeussocks5
+from protocol.mtproto import mtproto_native as mtproto
+from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends
+from fastapi.responses import Response, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
-from pydantic import BaseModel, Field
+import httpx
+import logging
 
-
-# Automatic SQLite backup settings.
-AUTO_BACKUP_INTERVAL_HOURS = float(os.getenv("AUTO_BACKUP_INTERVAL_HOURS", "24"))
-AUTO_BACKUP_KEEP = int(os.getenv("AUTO_BACKUP_KEEP", "7"))
-AUTO_BACKUP_DIR = os.getenv("AUTO_BACKUP_DIR", "/data/backups")
-
-LOG_PATH = os.environ.get("LOG_PATH", "vortex.log")
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("vortex")
+logger = logging.getLogger("RVG-Gateway")
 
-# علاوه بر لاگِ stdout (که Railway/هر پلتفرمی خودش جمع‌آوری می‌کند)، یک فایل
-# لاگ محلی هم با rotation نگه می‌داریم تا برای بررسی بعدی (مثلاً بعد از یک
-# کرش یا رفتار عجیب) در دسترس باشد، بدون این‌که رشد بی‌نهایت فضای دیسک را
-# مصرف کند: حداکثر ۵ مگابایت در هر فایل و ۳ نسخه‌ی قدیمی‌تر (در مجموع حداکثر
-# ~۲۰ مگابایت).
-try:
-    _file_handler = logging.handlers.RotatingFileHandler(
-        LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
-    )
-    _file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-    logging.getLogger().addHandler(_file_handler)
-except OSError as exc:
-    logger.warning("امکان نوشتن فایل لاگ در %s نبود (%s) — فقط لاگ stdout فعال است.", LOG_PATH, exc)
+IRAN_TZ = ZoneInfo("Asia/Tehran")
 
-APP_NAME = "Vortex Gateway"
-APP_VERSION = "4.1-hardened"
+app = FastAPI(title="RVG Gateway - codebox", docs_url=None, redoc_url=None)
 
-async def _automatic_sqlite_backup():
-    """Create periodic encrypted SQLite backups without blocking the event loop.
+# وقتی مستقیم با `python main.py` اجرا میشه، این ماژول با نام "__main__" ثبت
+# میشه نه "main". چون protocol/vless/vless.py و protocol/trojan/trojan.py با
+# `from main import (...)` به این فایل رفرنس می‌دن، بدون این خط پایتون مجبور
+# میشه کل main.py رو یک‌بار دیگه از صفر به‌عنوان ماژول جداگانه‌ی "main" اجرا کنه
+# که باعث circular import و کرش میشه. با alias کردن sys.modules، هر دو اسم
+# به همین نمونه‌ی در حال اجرا اشاره می‌کنن.
+sys.modules.setdefault("main", sys.modules[__name__])
 
-    Automatic backups never write a plaintext database to disk.  If encryption is
-    not configured, the worker stays disabled and logs a clear warning.
-    """
-    if AUTO_BACKUP_INTERVAL_HOURS <= 0:
-        logger.info("automatic backups disabled: AUTO_BACKUP_INTERVAL_HOURS <= 0")
-        return
-    if not CONFIG["backup_encryption_key"]:
-        logger.warning("automatic backups disabled: BACKUP_ENCRYPTION_KEY is not configured")
-        return
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    interval = max(60.0, AUTO_BACKUP_INTERVAL_HOURS * 3600)
-    first_run = True
-    while True:
-        try:
-            # Run once after startup, then on the configured interval.  This avoids
-            # a 24-hour window after deployment where no recovery point exists.
-            if not first_run:
-                await asyncio.sleep(interval)
-            first_run = False
-
-            db_path = globals().get("DB_PATH")
-            if not db_path or not os.path.exists(db_path):
-                continue
-
-            os.makedirs(AUTO_BACKUP_DIR, exist_ok=True)
-            stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-            tmp_db = os.path.join(AUTO_BACKUP_DIR, f".vortex-{stamp}.tmp.db")
-            backup_path = os.path.join(AUTO_BACKUP_DIR, f"vortex-{stamp}.db.enc")
-
-            def _backup():
-                src_conn = sqlite3.connect(db_path, timeout=30)
-                try:
-                    dst_conn = sqlite3.connect(tmp_db, timeout=30)
-                    try:
-                        src_conn.backup(dst_conn)
-                    finally:
-                        dst_conn.close()
-
-                    # Read the SQLite snapshot and wrap it in the same encrypted
-                    # container used by manual backups.  The plaintext temporary
-                    # file is removed before returning.
-                    with open(tmp_db, "rb") as fh:
-                        sqlite_bytes = fh.read()
-                    encrypted = ENCRYPTED_BACKUP_PREFIX + _backup_cipher().encrypt(sqlite_bytes)
-                    tmp_out = backup_path + ".tmp"
-                    with open(tmp_out, "wb") as fh:
-                        fh.write(encrypted)
-                        fh.flush()
-                        os.fsync(fh.fileno())
-                    os.replace(tmp_out, backup_path)
-                finally:
-                    src_conn.close()
-                    with contextlib.suppress(FileNotFoundError):
-                        os.remove(tmp_db)
-
-            await asyncio.to_thread(_backup)
-
-            backups = sorted(
-                glob.glob(os.path.join(AUTO_BACKUP_DIR, "vortex-*.db.enc")),
-                key=os.path.getmtime,
-                reverse=True,
-            )
-            for old in backups[AUTO_BACKUP_KEEP:]:
-                with contextlib.suppress(OSError):
-                    os.remove(old)
-            logger.info("automatic encrypted SQLite backup created: %s", backup_path)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            # Backups must never take down the gateway.
-            logger.error("automatic backup failed: %s", exc)
+# ── Persistence ───────────────────────────────────────────────────────────────
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+DATA_FILE = DATA_DIR / "rvg_state.json"
+SECRET_FILE = DATA_DIR / ".rvg_secret"
+SAVE_LOCK = asyncio.Lock()
 
 
+def _get_or_create_secret() -> str:
+    env_secret = os.environ.get("SECRET_KEY")
+    if env_secret:
+        return env_secret
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        if SECRET_FILE.exists():
+            val = SECRET_FILE.read_text(encoding="utf-8").strip()
+            if val:
+                return val
+        new_secret = secrets.token_urlsafe(32)
+        SECRET_FILE.write_text(new_secret, encoding="utf-8")
+        logger.info("SECRET_KEY جدید ساخته و در دیسک ذخیره شد (پایدار بین ری‌استارت‌ها).")
+        return new_secret
+    except Exception as e:
+        logger.warning(f"عدم امکان ذخیره‌ی SECRET_KEY روی دیسک: {e} — از مقدار موقت استفاده می‌شود.")
+        return secrets.token_urlsafe(32)
 
-async def _graceful_shutdown():
-    """Stop background workers and give active relay tasks a short grace period."""
-    global _AUTO_BACKUP_TASK
-
-    task = _AUTO_BACKUP_TASK
-    _AUTO_BACKUP_TASK = None
-    if task is not None and not task.done():
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
-    # Close known async clients if the application creates any at module scope.
-    for name in ("HTTP_CLIENT", "http_client", "SESSION", "session"):
-        resource = globals().get(name)
-        close = getattr(resource, "aclose", None) if resource is not None else None
-        if close is not None:
-            try:
-                result = close()
-                if inspect.isawaitable(result):
-                    await result
-            except Exception:
-                pass
-
-    active = []
-    for name in ("ACTIVE_TASKS", "RELAY_TASKS"):
-        value = globals().get(name)
-        if isinstance(value, (set, list, tuple)):
-            active.extend(t for t in value if isinstance(t, asyncio.Task) and not t.done())
-
-    if active:
-        _, pending = await asyncio.wait(active, timeout=5.0)
-        for pending_task in pending:
-            pending_task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-
-
-app = FastAPI(title=APP_NAME, docs_url=None, redoc_url=None)
-
-
-
-
-_AUTO_BACKUP_TASK = None
-
-# ───────────────────────── Config ─────────────────────────
 
 CONFIG = {
     "port": int(os.environ.get("PORT", 8000)),
-    "host_env": os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost"),
-    # اجازه‌دادن به کاربر برای محدود کردن دامنه‌های مجاز پروکسی. اگر خالی باشد،
-    # پروکسی برای هر دامنه‌ی عمومی (غیر داخلی) باز است اما همچنان در برابر SSRF محافظت می‌شود.
-    "proxy_allowlist": [
-        d.strip().lower()
-        for d in os.environ.get("PROXY_ALLOWED_DOMAINS", "").split(",")
-        if d.strip()
-    ],
-    # مسیر فایل SQLite برای ماندگاری لینک‌ها/رمز عبور بین ری‌استارت‌ها.
-    # روی Railway اگر می‌خواهید بین دیپلوی‌های مجدد (نه فقط ری‌استارت ساده)
-    # هم دیتا از دست نرود، باید یک Volume به همین مسیر متصل کنید؛ وگرنه
-    # فایل‌سیستم کانتینر با هر deploy از صفر ساخته می‌شود.
-    "db_path": os.environ.get("DB_PATH", "/data/vortex_data.db"),
-    # On Railway, fail closed when /data is not an actual mounted Volume.
-    # This prevents a fresh ephemeral SQLite DB from silently replacing the
-    # persistent database and making the previously configured password fail.
-    "require_persistent_volume": os.environ.get("REQUIRE_PERSISTENT_VOLUME", "0") == "1",
-    # Optional bootstrap credential for deployments without a persistent volume.
-    # Prefer a Railway secret variable over relying on ephemeral SQLite storage.
-    "admin_password": os.environ.get("ADMIN_PASSWORD", ""),
-    # اختیاری: توکن ربات تلگرام + chat_id برای ارسال هشدار وقتی مصرف یک لینک
-    # به ۸۰٪/۹۰٪/۱۰۰٪ سقف ترافیک می‌رسد. اگر خالی باشند، این قابلیت به‌سادگی
-    # غیرفعال می‌ماند (هیچ درخواست شبکه‌ای زده نمی‌شود).
-    "telegram_bot_token": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
-    "telegram_chat_id": os.environ.get("TELEGRAM_CHAT_ID", ""),
-    "trust_proxy": os.environ.get("TRUST_PROXY", "0") == "1",
-    "trusted_proxy_cidrs": [x.strip() for x in os.environ.get("TRUSTED_PROXY_CIDRS", "").split(",") if x.strip()],
-    "proxy_require_allowlist": os.environ.get("PROXY_REQUIRE_ALLOWLIST", "1") == "1",
-    "redis_url": os.environ.get("REDIS_URL", "").strip(),
-    "session_secret": os.environ.get("SESSION_SECRET", "").strip(),
-    "backup_encryption_key": os.environ.get("BACKUP_ENCRYPTION_KEY", "").strip(),
-    "allow_plaintext_backup": os.environ.get("ALLOW_PLAINTEXT_BACKUP", "0") == "1",
-    "allow_legacy_subscription_uuid": os.environ.get("ALLOW_LEGACY_SUBSCRIPTION_UUID", "0") == "1",
-    "proxy_max_response_bytes": int(os.environ.get("PROXY_MAX_RESPONSE_BYTES", str(50 * 1024 * 1024))),
-    "proxy_max_url_length": int(os.environ.get("PROXY_MAX_URL_LENGTH", "8192")),
-    "proxy_allowed_ports": {int(x.strip()) for x in os.environ.get("PROXY_ALLOWED_PORTS", "80,443,8080,8443").split(",") if x.strip().isdigit()},
-    # VLESS is a general TCP tunnel: restricting it to web ports breaks
-    # ordinary VPN/app traffic (e.g. 5228, 993, 5223, etc.). Keep the legacy
-    # TUNNEL_ALLOWED_PORTS variable for backward compatibility elsewhere, but
-    # make VLESS filtering explicit and opt-in. Empty means all TCP ports.
-    "tunnel_allowed_ports": {int(x.strip()) for x in os.environ.get("TUNNEL_ALLOWED_PORTS", "80,443,8080,8443").split(",") if x.strip().isdigit()},
-    "vless_allowed_ports": {int(x.strip()) for x in os.environ.get("VLESS_ALLOWED_PORTS", "").split(",") if x.strip().isdigit()},
-    "max_ws_initial_bytes": int(os.environ.get("MAX_WS_INITIAL_BYTES", "16384")),
-    "max_connections_per_ip": int(os.environ.get("MAX_CONNECTIONS_PER_IP", "25")),
-    "max_connections_global": int(os.environ.get("MAX_CONNECTIONS_GLOBAL", "500")),
-    "max_http_body_bytes": int(os.environ.get("MAX_HTTP_BODY_BYTES", str(2 * 1024 * 1024))),
-    "max_login_body_bytes": int(os.environ.get("MAX_LOGIN_BODY_BYTES", "16384")),
-}
-
-# کلید داخلی فقط برای امضای uuidهای دترمینیستیک استفاده می‌شود (نه برای پسورد)
-INSTANCE_SECRET = secrets.token_bytes(32)
-CSRF_SECRET = (CONFIG.get("session_secret") or "").encode("utf-8") or INSTANCE_SECRET
-
-_LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
-
-# ─── Zero-config public-host auto-detection ───────────────────────────────
-# قبلاً همه‌چیز (کوکی secure، CORS، لینک‌های تولیدشده، چک Origin وب‌سوکت)
-# فقط از روی RAILWAY_PUBLIC_DOMAIN تصمیم می‌گرفت. اما Railway صرفاً با
-# ساختن دامنه‌ی عمومی از Settings → Networking این متغیر را خودکار داخل
-# کانتینر تزریق نمی‌کند — باید دستی به‌عنوان Reference Variable اضافه شود،
-# و خیلی از دیپلوی‌ها همین قدم را جا می‌اندازند. برای اینکه گیت‌وی بدون
-# هیچ تنظیم دستی‌ای درست کار کند، دامنه‌ی عمومی واقعی را از روی هدر Host
-# همان درخواستی که واقعاً از بیرون می‌رسد (که Railway/Cloudflare همیشه
-# درست پاس می‌دهند) به‌صورت خودکار یاد می‌گیریم و به‌عنوان fallback بعد
-# از RAILWAY_PUBLIC_DOMAIN استفاده می‌کنیم.
-_DETECTED_PUBLIC_HOST: str | None = None
-RAILWAY_DETECTED = bool(os.environ.get("RAILWAY_ENVIRONMENT_NAME") or os.environ.get("RAILWAY_PROJECT_ID"))
-
-
-def _looks_like_public_host(host: str) -> bool:
-    h = host.strip().lower().rstrip(".")
-    if not h or h in _LOCAL_HOSTS:
-        return False
-    if h.endswith(".railway.internal"):
-        return False
-    return True
-
-
-def _note_request_host(raw_host_header: str | None) -> None:
-    """Learn the public hostname from a real incoming request, with zero configuration.
-
-    Called on every HTTP/WebSocket request. Only takes effect when
-    RAILWAY_PUBLIC_DOMAIN isn't explicitly set, so an explicit env var always
-    wins when present.
-    """
-    global _DETECTED_PUBLIC_HOST
-    if os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip():
-        return
-    if not raw_host_header:
-        return
-    parsed = urlparse(raw_host_header if "://" in raw_host_header else f"https://{raw_host_header}")
-    host = (parsed.hostname or "").strip().rstrip(".")
-    if not host or not _looks_like_public_host(host):
-        return
-    if parsed.port and parsed.port not in (80, 443):
-        host = f"{host}:{parsed.port}"
-    _DETECTED_PUBLIC_HOST = host
-
-
-def get_host() -> str:
-    """Return a normalized public hostname without scheme/path/port.
-
-    Railway normally provides RAILWAY_PUBLIC_DOMAIN as a hostname, but users
-    sometimes paste a full URL into the variable. Keeping one canonical form
-    prevents malformed URLs such as https://https://example.com in CORS,
-    cookies, generated subscriptions, and Worker deployment.
-
-    When RAILWAY_PUBLIC_DOMAIN isn't set at all, we fall back to whatever
-    public hostname we've automatically detected from real incoming traffic
-    (see _note_request_host) instead of silently pretending to be localhost.
-    """
-    raw = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
-    if not raw and _DETECTED_PUBLIC_HOST:
-        raw = _DETECTED_PUBLIC_HOST
-    if not raw:
-        return "localhost"
-    parsed = urlparse(raw if "://" in raw else f"https://{raw}")
-    host = (parsed.hostname or "").strip().rstrip(".")
-    if not host:
-        return "localhost"
-    if parsed.port and parsed.port not in (80, 443):
-        host = f"{host}:{parsed.port}"
-    return host
-
-
-def get_public_origin() -> str:
-    """Return the canonical public origin used by browser-facing URLs."""
-    if get_host() in _LOCAL_HOSTS:
-        return f"http://localhost:{CONFIG['port']}" if CONFIG["port"] != 80 else "http://localhost"
-    return f"https://{get_host()}"
-
-
-def cookie_secure() -> bool:
-    """Whether Set-Cookie should carry the Secure flag.
-
-    روی دیپلوی واقعی (Railway) همیشه HTTPS است؛ فقط برای اجرای لوکال روی
-    localhost کوکی secure را غیرفعال می‌کنیم تا تست محلی خراب نشود. این
-    مقدار دیگر ثابتِ زمان import نیست: علاوه بر هاست تشخیص‌داده‌شده، حضورِ
-    متغیرهای خودکارِ Railway (RAILWAY_ENVIRONMENT_NAME/RAILWAY_PROJECT_ID —
-    که برخلاف RAILWAY_PUBLIC_DOMAIN همیشه و بدون نیاز به تنظیم دستی توسط
-    Railway تزریق می‌شوند) هم کافی است تا HTTPS واقعی را فرض کنیم، حتی قبل
-    از اینکه اولین درخواست واقعی برسد و هاست را یاد بگیریم.
-    """
-    return RAILWAY_DETECTED or get_host() not in _LOCAL_HOSTS
-
-
-
-# Public endpoint used for generated client configurations.  When a
-# Cloudflare Worker relay is deployed, subscriptions/VLESS links must point
-# to the Worker (including its private gate path), not directly to Railway.
-ACTIVE_WORKER_URL = ""
-
-
-def _worker_endpoint_parts() -> tuple[str, str] | None:
-    base = ACTIVE_WORKER_URL.strip().rstrip("/")
-    if not base:
-        return None
-    parsed = urlparse(base)
-    if parsed.scheme not in ("https", "http") or not parsed.netloc:
-        return None
-    gate_path = parsed.path.rstrip("/")
-    if not gate_path or gate_path == "/":
-        return None
-    return parsed.netloc, gate_path
-
-
-# ───────────────────────── CORS ─────────────────────────
-# توجه: چون پنل از کوکی سشن استفاده می‌کند، origin وایلدکارد را با credentials
-# ترکیب نمی‌کنیم (این ترکیب یک ضعف امنیتی شناخته‌شده است).
-#
-# قبلاً از CORSMiddleware استانداردِ Starlette با یک allow_origins ثابت
-# استفاده می‌شد که فقط یک‌بار، در زمان import ماژول (قبل از رسیدن هر
-# درخواستی)، از روی RAILWAY_PUBLIC_DOMAIN محاسبه می‌شد. همان مشکلِ
-# RAILWAY_PUBLIC_DOMAIN تنظیم‌نشده اینجا هم بود، به‌علاوه‌ی اینکه حتی اگر
-# بعداً هاست را از روی ترافیک واقعی یاد بگیریم، آن لیست ثابت هرگز به‌روز
-# نمی‌شد. به‌جایش این میدل‌ور سبک، مبدأهای مجاز را در لحظه‌ی هر درخواست
-# با _allowed_origins() (همان منطقِ خودکار/بدون‌نیاز-به-تنظیم استفاده‌شده
-# برای وب‌سوکت) حساب می‌کند.
-@app.middleware("http")
-async def dynamic_cors_middleware(request: Request, call_next):
-    # هر درخواست واقعی (نه فقط آن‌هایی که Origin دارند) هاست عمومی را
-    # خودکار یاد می‌گیرد تا get_host()/cookie_secure() از همان اولین
-    # درخواست درست کار کنند، حتی بدون تنظیم RAILWAY_PUBLIC_DOMAIN.
-    _note_request_host(request.headers.get("host"))
-    origin = request.headers.get("origin")
-    if request.method == "OPTIONS" and origin:
-        allowed = _allowed_origins(request.headers.get("host"))
-        if origin in allowed:
-            resp = Response(status_code=200)
-            resp.headers["Access-Control-Allow-Origin"] = origin
-            resp.headers["Access-Control-Allow-Credentials"] = "true"
-            resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-CSRF-Token"
-            resp.headers["Vary"] = "Origin"
-            return resp
-        return Response(status_code=400)
-    response = await call_next(request)
-    if origin:
-        allowed = _allowed_origins(request.headers.get("host"))
-        if origin in allowed:
-            response.headers["Access-Control-Allow-Origin"] = origin
-            response.headers["Access-Control-Allow-Credentials"] = "true"
-            response.headers["Vary"] = "Origin"
-    return response
-
-
-@app.middleware("http")
-async def request_size_middleware(request: Request, call_next):
-    # Reject oversized control-plane requests before parsing JSON/forms.
-    # WebSocket upgrades are intentionally excluded; their own frame limits
-    # are enforced in the tunnel handler.
-    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
-        content_length = request.headers.get("content-length")
-        if content_length:
-            try:
-                length = int(content_length)
-            except ValueError:
-                return JSONResponse({"detail": "invalid content-length"}, status_code=400)
-            limit = CONFIG["max_login_body_bytes"] if request.url.path in {"/api/login", "/api/setup-password"} else CONFIG["max_http_body_bytes"]
-            if length > limit:
-                return JSONResponse({"detail": "request body too large"}, status_code=413)
-    return await call_next(request)
-
-
-@app.middleware("http")
-async def security_headers_middleware(request: Request, call_next):
-    # دفاع اضافه برای پنل مدیریتی که با کوکی سشن کار می‌کند: جلوگیری از
-    # کلیک‌جکینگ (X-Frame-Options)، sniff نادرست نوع محتوا، و محدودکردن
-    # منابعی که صفحه اجازه‌ی بارگذاری دارد (چون از Chart.js و آیکن‌های CDN
-    # استفاده می‌شود، آن دامنه‌ها صراحتاً در CSP مجاز شده‌اند).
-    #
-    # یک nonce تصادفیِ per-request تولید می‌کنیم و به هندلرهای صفحه (از طریق
-    # request.state) می‌دهیم تا فقط تگ‌های <script> که همین nonce را دارند
-    # اجازه‌ی اجرا داشته باشند.
-    #
-    # نکته‌ی مهم (که باعث خرابی همه‌ی دکمه‌های داشبورد شده بود): طبق اسپک CSP،
-    # وقتی یک nonce در script-src حاضر باشد، 'unsafe-inline' کاملاً نادیده
-    # گرفته می‌شود — نه فقط برای تگ‌های <script>، بلکه برای attributeهای
-    # event handler مثل onclick="..." هم. یعنی نگه‌داشتن 'unsafe-inline' در
-    # کنار nonce هیچ فایده‌ای نداشت و صرفاً گمراه‌کننده بود. راه‌حل واقعی این
-    # بود که همه‌ی onclick/onchange/oninput از HTML حذف و با addEventListener
-    # داخل همان <script> نانس‌دار جایگزین شوند (templates.py) — این‌طوری
-    # نیازی به unsafe-inline نیست و CSP هم واقعاً سخت‌گیرانه می‌ماند.
-    nonce = secrets.token_urlsafe(16)
-    request.state.csp_nonce = nonce
-    request_id = secrets.token_urlsafe(12)
-    request.state.request_id = request_id
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = request_id
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Referrer-Policy"] = "same-origin"
-    response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
-    response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
-    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=(), payment=()"
-    response.headers["X-Permitted-Cross-Domain-Policies"] = "none"
-    if cookie_secure():
-        # فقط وقتی واقعاً روی HTTPS هستیم (دیپلوی واقعی، نه اجرای لوکال) این
-        # هدر را می‌فرستیم؛ چون به مرورگر می‌گوید برای مدت طولانی فقط HTTPS
-        # را برای این دامنه بپذیرد، فرستادنش روی http://localhost باعث
-        # می‌شود توسعه‌ی محلی بعداً به مشکل بخورد.
-        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-    response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; "
-        f"script-src 'self' 'nonce-{nonce}' https://cdnjs.cloudflare.com; "
-        # FONT_LINKS (templates.py) actually loads a stylesheet from
-        # fonts.googleapis.com (Vazirmatn/JetBrains Mono), whose @font-face
-        # rules in turn point at fonts.gstatic.com for the woff2 files.
-        # style-src/font-src previously only allowed cdn.jsdelivr.net, so the
-        # browser silently blocked the Google Fonts <link> and its font
-        # files on every page (login/dashboard/sub) — text just fell back to
-        # a generic system font with no visible error besides the CSP
-        # violation in devtools. Both origins now match what is actually
-        # requested.
-        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; "
-        "font-src 'self' https://cdn.jsdelivr.net https://fonts.gstatic.com; "
-        "img-src 'self' data:; "
-        "connect-src 'self'; "
-        "frame-ancestors 'none'"
-    )
-    if request.url.path.startswith(("/api/", "/login", "/dashboard", "/sub/")):
-        response.headers["Cache-Control"] = "no-store"
-    return response
-
-# ───────────────────────── In-memory state ─────────────────────────
-
-LINKS: dict = {}
-# O(1) subscription-token lookup. Keeping this separate from LINKS avoids an
-# O(n) scan on every client refresh, which otherwise becomes expensive with
-# thousands of subscriptions.
-SUBSCRIPTION_INDEX: dict[str, str] = {}
-LINKS_LOCK = asyncio.Lock()
-
-connections: dict = {}
-connections_by_ip: dict[str, int] = defaultdict(int)
-# Tracks the asyncio Task running each active /tunnel/{uid} websocket handler,
-# so _graceful_shutdown() can find and wait on real in-flight relay tasks
-# (see websocket_tunnel below, which adds/removes itself here).
-RELAY_TASKS: set = set()
-CONNECTIONS_LOCK = asyncio.Lock()
-stats = {"total_bytes": 0, "total_requests": 0, "total_errors": 0, "start_time": time.time(), "ads_blocked": 0}
-
-# ───────────────────────── Ads Blocker ─────────────────────────
-# مسدودسازی مقصدهای تبلیغاتی/ردیاب شناخته‌شده در سطح تونل VLESS، پیش از
-# resolve/connect. کاملاً از پنل مدیریت خاموش/روشن می‌شود (ذخیره در جدول
-# settings) و روی هر اتصال جدید (نه اتصالات درحال‌اجرا) اعمال می‌شود.
-# لیست پایه کوچک و متمرکز روی شبکه‌های تبلیغاتی/آنالیتیکس پراستفاده است؛
-# ادمین می‌تواند دامنه‌های دلخواه را از پنل اضافه کند.
-ADS_BLOCK_ENABLED: bool = False
-ADS_BLOCK_CUSTOM_DOMAINS: set[str] = set()
-
-_BUILTIN_AD_DOMAINS: set[str] = {
-    # --- Google / DoubleClick ad & analytics ---
-    "doubleclick.net", "googlesyndication.com", "googleadservices.com",
-    "google-analytics.com", "googletagmanager.com", "googletagservices.com",
-    "adservice.google.com", "adservice.google.co.uk", "adservice.google.de",
-    "adservice.google.fr", "pagead2.googlesyndication.com", "2mdn.net",
-    "admob.com", "admeld.com", "googleoptimize.com", "google-analytics.co",
-    "urchin.com", "adsense.com", "gads.pubmatic.com",
-    # --- Meta / Facebook ---
-    "connect.facebook.net", "an.facebook.com", "atdmt.com",
-    # --- Amazon ---
-    "amazon-adsystem.com", "aax.amazon-adsystem.com", "assoc-amazon.com",
-    # --- Microsoft / Bing / LinkedIn ads ---
-    "bat.bing.com", "ads.linkedin.com", "px.ads.linkedin.com",
-    "advertising.microsoft.com", "adnxs.net",
-    # --- TikTok / Twitter / Snap / Pinterest ads ---
-    "analytics.tiktok.com", "ads-api.tiktok.com", "ads-twitter.com",
-    "analytics.twitter.com", "sc-static.net",
-    "tr.snapchat.com", "ads.pinterest.com", "ct.pinterest.com",
-    # --- Major ad exchanges / SSPs / DSPs ---
-    "adnxs.com", "adsrvr.org", "adform.net", "adroll.com", "advertising.com",
-    "pubmatic.com", "rubiconproject.com", "openx.net", "casalemedia.com",
-    "bidswitch.net", "contextweb.com", "yieldmo.com", "sharethrough.com",
-    "media.net", "criteo.com", "criteo.net", "smartadserver.com",
-    "serving-sys.com", "adtechus.com", "yahoo-ad.net", "taboola.com",
-    "outbrain.com", "mgid.com", "revcontent.com", "adcolony.com",
-    "gumgum.com", "indexexchange.com", "improvedigital.com", "triplelift.com",
-    "33across.com", "sonobi.com", "sortable.com", "smartyads.com",
-    "adyoulike.com", "undertone.com", "districtm.io", "spotx.tv",
-    "loopme.com", "verizonmedia.com", "yieldlab.net", "ligatus.com",
-    "adpone.com", "richaudience.com", "onetag-sys.com", "connatix.com",
-    "vidoomy.com", "primis.tech", "playwire.com", "freewheel.com",
-    # --- Mobile / in-app ad SDKs ---
-    "applovin.com", "unityads.unity3d.com", "vungle.com", "ironsrc.com",
-    "chartboost.com", "smaato.com", "mopub.com", "startapp.com",
-    "inmobi.com", "adcash.com", "propellerads.com", "popads.net",
-    "exoclick.com", "adsterra.com", "bidvertiser.com", "tapjoy.com",
-    "fyber.com", "tapdaq.com", "adcolony.com", "leadbolt.com",
-    "airpush.com", "mobfox.com", "supersonicads.com", "adcash.net",
-    "yieldmo.mobi", "verve.com", "digitalturbine.com",
-    # --- Tracking / analytics / measurement / attribution ---
-    "scorecardresearch.com", "quantserve.com", "moatads.com",
-    "doubleverify.com", "adsafeprotected.com", "branch.io", "appsflyer.com",
-    "adjust.com", "kochava.com", "flurry.com", "mixpanel.com",
-    "segment.io", "hotjar.com", "crazyegg.com", "mouseflow.com",
-    "chartbeat.com", "amplitude.com", "clicktale.net", "fullstory.com",
-    "heap.io", "webengage.com", "clevertap.com", "optimizely.com",
-    "newrelic.com", "nr-data.net", "sentry.io", "bugsnag.com",
-    "onesignal.com", "pushwoosh.com", "cxense.com", "parsely.com",
-    "chartbeat.net", "krxd.net", "bluekai.com", "exelator.com",
-    "mathtag.com", "rlcdn.com", "tapad.com", "agkn.com", "eyeota.net",
-    # --- Native / popunder / redirect ad networks ---
-    "adk2.com", "spotxchange.com", "teads.tv", "innovid.com", "zedo.com",
-    "lijit.com", "sovrn.com", "popcash.net", "clickadu.com", "hilltopads.net",
-    "adsclickmedia.com", "adnium.com", "trafficjunky.com", "juicyads.com",
-    "eroadvertising.com", "propellerclick.com", "onclickmax.com",
-    "adskeeper.co.uk", "mgid.com", "content.ad", "revenuehits.com",
-    "clickaine.com", "monetizemore.com", "ezoic.net", "ezodn.com",
-    # --- Affiliate / tag-manager / consent ad-tech ---
-    "impact.com", "cj.com", "linksynergy.com", "awin1.com", "shareasale.com",
-    "rakutenmarketing.com", "flashtalking.com", "adsymptotic.com",
-    "sitescout.com", "adition.com", "adsafe.org", "trustarc.com",
-    "quantcast.com", "adroll.com", "perfectaudience.com",
+    "secret": _get_or_create_secret(),
+    "host": os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost"),
+    "disable_logging": False,
 }
 
 
-def _normalize_ad_domain(domain: str) -> str:
-    return domain.strip().lower().strip(".")
-
-
-def is_ad_blocked_domain(host: str) -> bool:
-    """آیا host (یا یکی از زیردامنه‌های آن) در لیست مسدودسازی تبلیغات است.
-
-    فقط با نام‌های دامنه معنا دارد (نه IP خام). تطبیق روی suffix دامنه انجام
-    می‌شود تا مثلاً pagead2.googlesyndication.com هم زیرمجموعه‌ی
-    googlesyndication.com شناخته شود.
-    """
-    if not ADS_BLOCK_ENABLED or not host:
-        return False
-    h = host.strip().lower().strip(".")
-    if not h or h.replace(".", "").isdigit():
-        return False  # آدرس IPv4 خام؛ لیست فقط شامل نام دامنه است
-    if ":" in h:
-        return False  # IPv6 literal
-    all_domains = _BUILTIN_AD_DOMAINS | ADS_BLOCK_CUSTOM_DOMAINS
-    return any(h == d or h.endswith("." + d) for d in all_domains)
-error_logs: deque = deque(maxlen=50)
-hourly_traffic: dict = defaultdict(int)
-# مشابه hourly_traffic ولی به‌ازای هر لینک، برای نمودار مصرف اختصاصی هر لینک
-# در داشبورد. کلید بیرونی uuid لینک است، کلید داخلی همان الگوی ساعت ("HH:00").
-link_hourly_traffic: dict = defaultdict(lambda: defaultdict(int))
-
-http_client: httpx.AsyncClient | None = None
-redis_client = None
-
-# ───────────────────────── Persistence (SQLite) ─────────────────────────
-# لینک‌ها و هش رمز عبور در یک فایل SQLite کنار برنامه ذخیره می‌شوند تا با
-# ری‌استارت سرویس از بین نروند. دیکشنری‌های بالا (LINKS, AUTH) همچنان
-# منبع اصلیِ خواندن سریع در مسیر داغِ کد (تونل/پروکسی) هستند؛ SQLite فقط
-# برای نوشتن پشت‌صحنه و بارگذاری اولیه استفاده می‌شود — پس هیچ query ای
-# در مسیر رله‌ی داده اجرا نمی‌شود و سرعت تونل تحت تأثیر قرار نمی‌گیرد.
-DB_PATH = CONFIG["db_path"]
-DB_LOCK = asyncio.Lock()  # نوشتن‌های sqlite را سریالایز می‌کند تا خطای "database is locked" رخ ندهد
-
-
-def _db_connect() -> sqlite3.Connection:
-    # SQLite is only used for control-plane persistence.  Make every
-    # connection resilient to short write bursts and power-loss scenarios.
-    db_dir = os.path.dirname(os.path.abspath(DB_PATH))
-    if db_dir:
-        os.makedirs(db_dir, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=30000")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
-
-
-def _db_init():
-    conn = _db_connect()
-    try:
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS links (
-                uuid TEXT PRIMARY KEY,
-                label TEXT NOT NULL,
-                limit_bytes INTEGER NOT NULL,
-                used_bytes INTEGER NOT NULL,
-                created_at TEXT NOT NULL,
-                active INTEGER NOT NULL
-            )"""
-        )
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )"""
-        )
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS audit_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at TEXT NOT NULL,
-                action TEXT NOT NULL,
-                ip TEXT,
-                details TEXT
-            )"""
-        )
-        # مهاجرت برای دیتابیس‌های قدیمی‌تر: دو ستون جدید برای «تاریخ انقضا» و
-        # «محدودیت سرعت» به‌ازای هر لینک. چون SQLite با نبود این ستون‌ها در
-        # جدول‌های ساخته‌شده‌ی قبلی خطا می‌دهد، وجودشان را چک می‌کنیم و فقط
-        # در صورت نبود اضافه می‌کنیم (ALTER TABLE ADD COLUMN ایمن و بدون
-        # از دست رفتن داده‌ی موجود است).
-        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(links)").fetchall()}
-        if "expires_at" not in existing_cols:
-            conn.execute("ALTER TABLE links ADD COLUMN expires_at TEXT")
-        if "speed_limit_bps" not in existing_cols:
-            conn.execute("ALTER TABLE links ADD COLUMN speed_limit_bps INTEGER NOT NULL DEFAULT 0")
-        if "subscription_token" not in existing_cols:
-            conn.execute("ALTER TABLE links ADD COLUMN subscription_token TEXT")
-        # مهاجرت: هر لینک می‌تواند مسیر تولید کانفیگش را انتخاب کند —
-        # 'auto' (پیش‌فرض قبلی: اگر Worker فعال باشد از آن استفاده کن)،
-        # 'railway' (همیشه مستقیم به Railway) یا 'cloudflare' (همیشه از Worker،
-        # حتی اگر بعداً هم فعال شود). لینک‌های قدیمی همان رفتار قبلی auto را می‌گیرند.
-        if "route_via" not in existing_cols:
-            conn.execute("ALTER TABLE links ADD COLUMN route_via TEXT NOT NULL DEFAULT 'auto'")
-        # Every link gets a high-entropy subscription secret. Existing UUID-based
-        # subscriptions can be disabled after migration with ALLOW_LEGACY_SUBSCRIPTION_UUID=0.
-        rows = conn.execute("SELECT uuid FROM links WHERE subscription_token IS NULL OR subscription_token = ''").fetchall()
-        for (uid,) in rows:
-            conn.execute("UPDATE links SET subscription_token=? WHERE uuid=?", (secrets.token_urlsafe(32), uid))
-        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_links_subscription_token ON links(subscription_token)")
-        conn.commit()
-    finally:
-        conn.close()
-
-
-# توابع sqlite3 استاندارد کتابخانه، حتی برای یک UPDATE ساده، synchronous و
-# بلاک‌کننده هستند. قبلاً این توابع مستقیم داخل کوروتین‌ها صدا زده می‌شدند؛
-# یعنی هر نوشتن روی دیسک (هرچند چند میلی‌ثانیه) کل event loop را می‌بست —
-# همان event loop ای که هم‌زمان مسئول رله‌ی بایت‌های تونل‌های VLESS باز است.
-# با هول‌دادن بخش synchronous به یک ترد جدا (asyncio.to_thread) این بلاک‌شدن
-# از event loop اصلی حذف می‌شود؛ DB_LOCK همچنان نوشتن‌ها را سریالایز می‌کند
-# تا خطای "database is locked" رخ ندهد.
-
-def _db_get_settings_sync():
-    """Return the application settings as a plain dict.
-
-    This is kept synchronous because callers run database work through
-    asyncio.to_thread(), avoiding blocking the event loop.
-
-    Bug fixed in this audit: this function used to open a bare
-    ``sqlite3.connect(DB_PATH)`` instead of going through ``_db_connect()``.
-    That connection never received the WAL / busy_timeout PRAGMAs that every
-    other connection in this module gets, so a call landing at the same
-    moment as a write (e.g. link create/update, usage flush) could raise a
-    raw "database is locked" error instead of transparently waiting like the
-    rest of the app does. It is now routed through ``_db_connect()`` for a
-    consistent, resilient connection.
-    """
-    conn = _db_connect()
-    try:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT key, value FROM settings"
-        ).fetchall()
-    finally:
-        conn.close()
-    return {row["key"]: row["value"] for row in rows}
-
-
-def _db_load_all_sync():
-    conn = _db_connect()
-    try:
-        link_rows = conn.execute(
-            "SELECT uuid, label, limit_bytes, used_bytes, created_at, active, "
-            "expires_at, speed_limit_bps, subscription_token, route_via FROM links"
-        ).fetchall()
-        setting_rows = conn.execute("SELECT key, value FROM settings").fetchall()
-        return link_rows, setting_rows
-    finally:
-        conn.close()
-
-
-async def _db_load_all():
-    async with DB_LOCK:
-        return await asyncio.to_thread(_db_load_all_sync)
-
-
-def _db_upsert_link_sync(uid: str, data: dict):
-    conn = _db_connect()
-    try:
-        conn.execute(
-            """INSERT INTO links (uuid, label, limit_bytes, used_bytes, created_at, active,
-                                   expires_at, speed_limit_bps, subscription_token, route_via)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(uuid) DO UPDATE SET
-                   label=excluded.label, limit_bytes=excluded.limit_bytes,
-                   used_bytes=excluded.used_bytes, created_at=excluded.created_at,
-                   active=excluded.active, expires_at=excluded.expires_at,
-                   speed_limit_bps=excluded.speed_limit_bps,
-                   subscription_token=excluded.subscription_token,
-                   route_via=excluded.route_via""",
-            (uid, data["label"], data["limit_bytes"], data["used_bytes"],
-             data["created_at"], int(data["active"]),
-             data.get("expires_at"), data.get("speed_limit_bps", 0),
-             data.get("subscription_token") or secrets.token_urlsafe(32),
-             data.get("route_via") or "auto"),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-async def _db_upsert_link(uid: str, data: dict):
-    async with DB_LOCK:
-        await asyncio.to_thread(_db_upsert_link_sync, uid, data)
-
-
-def _db_delete_link_sync(uid: str):
-    conn = _db_connect()
-    try:
-        conn.execute("DELETE FROM links WHERE uuid=?", (uid,))
-        conn.commit()
-    finally:
-        conn.close()
-
-
-async def _db_delete_link(uid: str):
-    async with DB_LOCK:
-        await asyncio.to_thread(_db_delete_link_sync, uid)
-
-
-def _db_bulk_delete_links_sync(uids: list[str]):
-    conn = _db_connect()
-    try:
-        conn.executemany("DELETE FROM links WHERE uuid=?", [(u,) for u in uids])
-        conn.commit()
-    finally:
-        conn.close()
-
-
-async def _db_bulk_delete_links(uids: list[str]):
-    async with DB_LOCK:
-        await asyncio.to_thread(_db_bulk_delete_links_sync, uids)
-
-
-def _db_bulk_upsert_links_sync(items: list[tuple[str, dict]]):
-    # همان کوئری _db_upsert_link_sync، ولی برای چند لینک هم‌زمان با یک
-    # executemany روی یک اتصال؛ برای عملیات دسته‌ای (bulk) به‌جای باز/بستن
-    # یک اتصال SQLite جدا برای هر لینک (که برای صدها لینک کند و غیرضروری
-    # است)، همه در یک تراکنش نوشته می‌شوند.
-    conn = _db_connect()
-    try:
-        conn.executemany(
-            """INSERT INTO links (uuid, label, limit_bytes, used_bytes, created_at, active,
-                                   expires_at, speed_limit_bps, subscription_token, route_via)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(uuid) DO UPDATE SET
-                   label=excluded.label, limit_bytes=excluded.limit_bytes,
-                   used_bytes=excluded.used_bytes, created_at=excluded.created_at,
-                   active=excluded.active, expires_at=excluded.expires_at,
-                   speed_limit_bps=excluded.speed_limit_bps,
-                   subscription_token=excluded.subscription_token,
-                   route_via=excluded.route_via""",
-            [
-                (uid, data["label"], data["limit_bytes"], data["used_bytes"],
-                 data["created_at"], int(data["active"]),
-                 data.get("expires_at"), data.get("speed_limit_bps", 0),
-                 data.get("subscription_token") or secrets.token_urlsafe(32),
-                 data.get("route_via") or "auto")
-                for uid, data in items
-            ],
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-async def _db_bulk_upsert_links(items: list[tuple[str, dict]]):
-    async with DB_LOCK:
-        await asyncio.to_thread(_db_bulk_upsert_links_sync, items)
-
-
-def _db_replace_all_links_sync(links_snapshot: dict):
-    conn = _db_connect()
-    try:
-        conn.execute("DELETE FROM links")
-        conn.executemany(
-            "INSERT INTO links (uuid, label, limit_bytes, used_bytes, created_at, active, "
-            "expires_at, speed_limit_bps, subscription_token, route_via) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            [
-                (uid, d["label"], d["limit_bytes"], d["used_bytes"], d["created_at"], int(d["active"]),
-                 d.get("expires_at"), d.get("speed_limit_bps", 0), d.get("subscription_token") or secrets.token_urlsafe(32),
-                 d.get("route_via") or "auto")
-                for uid, d in links_snapshot.items()
-            ],
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-async def _db_replace_all_links(links_snapshot: dict):
-    """برای بازیابی (restore) کامل: کل جدول links جایگزین می‌شود."""
-    async with DB_LOCK:
-        await asyncio.to_thread(_db_replace_all_links_sync, links_snapshot)
-
-
-def _db_restore_sync(links_snapshot: dict, password_hash: str | None):
-    conn = _db_connect()
-    try:
-        with conn:
-            conn.execute("DELETE FROM links")
-            conn.executemany(
-                "INSERT INTO links (uuid, label, limit_bytes, used_bytes, created_at, active, expires_at, speed_limit_bps, subscription_token, route_via) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                [
-                    (uid, d["label"], d["limit_bytes"], d["used_bytes"], d["created_at"], int(d["active"]), d.get("expires_at"), d.get("speed_limit_bps", 0), d.get("subscription_token") or secrets.token_urlsafe(32), d.get("route_via") or "auto")
-                    for uid, d in links_snapshot.items()
-                ],
-            )
-            if password_hash is not None:
-                conn.execute(
-                    "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    ("password_hash", password_hash),
-                )
-    finally:
-        conn.close()
-
-
-async def _db_restore(links_snapshot: dict, password_hash: str | None):
-    async with DB_LOCK:
-        await asyncio.to_thread(_db_restore_sync, links_snapshot, password_hash)
-
-
-def _db_audit_sync(action: str, ip: str, details: str):
-    conn = _db_connect()
-    try:
-        conn.execute("INSERT INTO audit_log (created_at, action, ip, details) VALUES (?,?,?,?)", (datetime.now().isoformat(), action, ip, details[:1000]))
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def _db_recent_audit_sync(limit: int):
-    conn = _db_connect()
-    try:
-        return conn.execute("SELECT created_at, action, ip, details FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-    finally:
-        conn.close()
-
-
-async def audit(action: str, ip: str = "", details: str = ""):
-    try:
-        await asyncio.to_thread(_db_audit_sync, action, ip, details)
-    except Exception as exc:
-        logger.warning("audit persistence failed: %s", exc)
-
-
-def _db_set_setting_sync(key: str, value: str):
-    conn = _db_connect()
-    try:
-        conn.execute(
-            "INSERT INTO settings (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, value),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-async def _db_set_setting(key: str, value: str):
-    async with DB_LOCK:
-        await asyncio.to_thread(_db_set_setting_sync, key, value)
-
-
-# مصرف بایت‌به‌بایت هر پکت را مستقیم روی دیسک نمی‌نویسیم (خیلی کند می‌شود)؛
-# فقط uid لینک‌های تغییرکرده را در یک set نگه می‌داریم و هر چند ثانیه یک‌بار
-# با _flush_usage به‌صورت batch روی دیسک می‌نویسیم.
-_dirty_usage_uids: set = set()
-_usage_flush_task: asyncio.Task | None = None
-
-
-def _flush_usage_sync(snapshot: list):
-    conn = _db_connect()
-    try:
-        # Write the exact in-memory value captured under LINKS_LOCK.  A generation
-        # check below prevents an older snapshot from clearing a newer dirty mark.
-        conn.executemany("UPDATE links SET used_bytes=? WHERE uuid=?", snapshot)
-        conn.commit()
-    finally:
-        conn.close()
-
-
-async def _flush_usage():
-    # Keep LINKS_LOCK while taking DB_LOCK and writing the snapshot.  This gives
-    # control-plane operations (reset/delete/update) a consistent lock order and
-    # prevents a quota reset from racing with an older usage flush.
-    async with LINKS_LOCK:
-        dirty = list(_dirty_usage_uids)
-        if not dirty:
-            return
-        snapshot = [(LINKS[uid]["used_bytes"], uid) for uid in dirty if uid in LINKS]
-        snapshot_values = {uid: value for value, uid in snapshot}
-        try:
-            async with DB_LOCK:
-                await asyncio.to_thread(_flush_usage_sync, snapshot)
-        except Exception as exc:
-            # Never drop dirty markers when SQLite/I/O fails; the next periodic
-            # pass must retry so usage cannot silently disappear.
-            logger.error("usage flush failed; dirty state retained: %s", exc)
-            return
-        for uid in dirty:
-            if uid not in LINKS or LINKS[uid]["used_bytes"] == snapshot_values.get(uid):
-                _dirty_usage_uids.discard(uid)
-
-
-async def _periodic_usage_flush():
-    while True:
-        try:
-            await asyncio.sleep(10)
-            await _flush_usage()
-        except asyncio.CancelledError:
-            break
-        except Exception as exc:
-            logger.error("usage flush error: %s", exc)
-
-# ───────────────────────── Per-link speed throttling ─────────────────────────
-# پیاده‌سازی «سطل توکن» (token bucket) برای محدودکردن سرعت هر لینک. ظرفیت
-# سطل برابر نرخ مجاز در نظر گرفته می‌شود (یعنی حداکثر یک ثانیه burst مجاز
-# است) که برای ترافیک واقعی (پکت‌های نامنظم) طبیعی‌تر از یک محدودیت سخت‌گیرانه
-# است. یک باکت به‌ازای هر لینک، فقط وقتی speed_limit_bps > 0 باشد، ساخته می‌شود.
-class _TokenBucket:
-    __slots__ = ("rate", "capacity", "tokens", "last", "lock")
-
-    def __init__(self, rate_bps: int):
-        self.rate = rate_bps
-        self.capacity = max(rate_bps, RELAY_BUF)
-        self.tokens = float(self.capacity)
-        self.last = time.monotonic()
-        self.lock = asyncio.Lock()
-
-    async def consume(self, n: int):
-        async with self.lock:
-            now = time.monotonic()
-            self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.rate)
-            self.last = now
-            self.tokens -= n
-            if self.tokens < 0:
-                wait = -self.tokens / self.rate
-                self.tokens = 0
-                await asyncio.sleep(wait)
-
-
-_rate_limiters: dict = {}  # uid -> (configured_rate_bps, _TokenBucket)
-
-
-async def throttle(uid: str, rate_bps: int, n: int):
-    """اگر لینک محدودیت سرعت داشته باشد، به اندازه‌ی لازم مکث می‌کند تا نرخ
-    انتقال از سقف تعیین‌شده عبور نکند. اگر rate_bps صفر باشد (نامحدود) بلافاصله
-    برمی‌گردد."""
-    if rate_bps <= 0:
-        return
-    entry = _rate_limiters.get(uid)
-    if entry is None or entry[0] != rate_bps:
-        bucket = _TokenBucket(rate_bps)
-        _rate_limiters[uid] = (rate_bps, bucket)
+def apply_logging_state():
+    """logging.disable سطح‌بندی سراسریه (روی کل ماژول logging اثر می‌ذاره)، پس
+    یک‌جا همه‌ی logger های پروژه (RVG-Gateway، uvicorn.access، uvicorn.error،
+    mtproto و ...) رو خاموش/روشن می‌کنه. چک داخلیش خیلی ارزونه، پس این خودش
+    باعث می‌شه سربار I/O و فرمت‌کردن استرینگ لاگ‌ها کاملاً حذف بشه."""
+    if CONFIG.get("disable_logging"):
+        logging.disable(logging.CRITICAL)
     else:
-        bucket = entry[1]
-    await bucket.consume(n)
+        logging.disable(logging.NOTSET)
 
 
-# ───────────────────────── Telegram notifications ─────────────────────────
-# هشدار اختیاری وقتی مصرف یک لینک به آستانه‌های ۸۰٪/۹۰٪/۱۰۰٪ سقف ترافیک
-# می‌رسد. کاملاً اختیاری است — اگر TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID ست
-# نشده باشند، send_telegram_message بی‌سروصدا هیچ کاری نمی‌کند.
-NOTIFY_THRESHOLDS = (80, 90, 100)
-# آخرین آستانه‌ای که برای هر لینک اعلان ارسال شده (در حافظه؛ با ری‌استارت
-# سرویس پاک می‌شود، یعنی ممکن است حداکثر یک اعلان تکراری بعد از هر ری‌استارت
-# دریافت کنید — یک تبادل ساده برای این‌که مسیر داغِ رله‌ی داده هیچ نوشتن
-# اضافه‌ای روی دیسک نداشته باشد).
-_notified_pct: dict = defaultdict(int)
-
-
-async def send_telegram_message(text: str) -> bool:
-    token = CONFIG["telegram_bot_token"]
-    chat_id = CONFIG["telegram_chat_id"]
-    if not token or not chat_id or not http_client:
-        return False
+async def load_state():
+    global LINKS, AUTH, SUBS
     try:
-        resp = await http_client.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
-        )
-        return resp.status_code == 200
-    except Exception as exc:
-        logger.error("telegram notify error: %s", exc)
-        return False
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        if DATA_FILE.exists():
+            async with aiofiles.open(DATA_FILE, "r", encoding="utf-8") as f:
+                raw = await f.read()
+            data = json.loads(raw)
+            LINKS.update(data.get("links", {}))
+            SUBS.update(data.get("subs", {}))
+            NODE_KEYS.update(data.get("node_keys", {}))
+            for nid, n in (data.get("nodes") or {}).items():
+                NODES[nid] = _normalize_node(n)
+            if "password_hash" in data:
+                AUTH["password_hash"] = data["password_hash"]
+            CONFIG["disable_logging"] = bool(data.get("disable_logging", False))
+            apply_logging_state()
+            logger.info(
+                f"State loaded: {len(LINKS)} links, {len(SUBS)} subs, "
+                f"{len(NODES)} nodes, {len(NODE_KEYS)} node keys"
+            )
+    except Exception as e:
+        logger.warning(f"Could not load state: {e}")
 
-
-def _maybe_schedule_quota_alert(uid: str, label: str, pct: float):
-    crossed = None
-    for t in NOTIFY_THRESHOLDS:
-        if pct >= t and _notified_pct[uid] < t:
-            crossed = t
-    if crossed is None:
-        return
-    _notified_pct[uid] = crossed
-    emoji = "🛑" if crossed >= 100 else "⚠️"
-    text = f"{emoji} Vortex Gateway\nلینک «{label}» به {crossed}٪ از سقف ترافیک خود رسید."
-    if crossed >= 100:
-        text += "\nاین لینک تا بازنشانی/افزایش سقف، مسدود شده است."
-    asyncio.create_task(send_telegram_message(text))
-
-
-# ───────────────────────── Tunnel connection limits ─────────────────────────
-# بدون این سقف‌ها، یک لینک (یا یک لینک لو‌رفته) می‌تواند هزاران WebSocket
-# هم‌زمان باز کند و منابع سرور (فایل‌دیسکریپتور/رم/CPU) را با یک DoS ساده
-# مصرف کند. یک سقف کلی و یک سقف به‌ازای هر لینک در نظر می‌گیریم.
-MAX_CONNECTIONS_GLOBAL = CONFIG["max_connections_global"]
-MAX_CONNECTIONS_PER_LINK = int(os.environ.get("MAX_CONNECTIONS_PER_LINK", "50"))
-_link_conn_counts: dict = defaultdict(int)
-_global_conn_count = 0
-_conn_limit_lock = asyncio.Lock()
-
-
-async def try_acquire_connection_slot(uid: str) -> bool:
-    global _global_conn_count
-    async with _conn_limit_lock:
-        if _global_conn_count >= MAX_CONNECTIONS_GLOBAL:
-            return False
-        if _link_conn_counts[uid] >= MAX_CONNECTIONS_PER_LINK:
-            return False
-        _global_conn_count += 1
-        _link_conn_counts[uid] += 1
-        return True
-
-
-async def release_connection_slot(uid: str):
-    global _global_conn_count
-    async with _conn_limit_lock:
-        if _link_conn_counts.get(uid, 0) > 0:
-            _link_conn_counts[uid] -= 1
-            _global_conn_count = max(0, _global_conn_count - 1)
-            if _link_conn_counts[uid] == 0:
-                _link_conn_counts.pop(uid, None)
-
-# ───────────────────────── Auth: password hashing ─────────────────────────
-
-# Argon2id is the primary password hash. PBKDF2 is retained only for seamless
-# migration of older installations; a successful PBKDF2 login is transparently
-# upgraded to Argon2id.
-PASSWORD_HASHER = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=2, hash_len=32, salt_len=16)
-PBKDF2_ITERATIONS = 260_000
-
-def hash_password(password: str, salt: bytes | None = None) -> str:
-    return PASSWORD_HASHER.hash(password)
-
-def _verify_pbkdf2(password: str, stored: str) -> bool:
-    try:
-        salt_hex, hash_hex = stored.split("$")
-        salt = bytes.fromhex(salt_hex)
-        dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PBKDF2_ITERATIONS)
-        return hmac.compare_digest(dk.hex(), hash_hex)
-    except Exception:
-        return False
-
-def verify_password(password: str, stored: str) -> bool:
-    if not stored:
-        return False
-    if stored.startswith("$argon2id$"):
+async def save_state():
+    async with SAVE_LOCK:
         try:
-            return PASSWORD_HASHER.verify(stored, password)
-        except (VerifyMismatchError, InvalidHashError, ValueError):
-            return False
-    return _verify_pbkdf2(password, stored)
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            data = {
+                "links": dict(LINKS),
+                "subs": dict(SUBS),
+                "node_keys": dict(NODE_KEYS),
+                "nodes": dict(NODES),
+                "password_hash": AUTH["password_hash"],
+                "disable_logging": CONFIG.get("disable_logging", False),
+                "saved_at": datetime.now().isoformat(),
+            }
+            tmp = DATA_FILE.with_suffix(".tmp")
+            async with aiofiles.open(tmp, "w", encoding="utf-8") as f:
+                await f.write(json.dumps(data, ensure_ascii=False, indent=2))
+            tmp.replace(DATA_FILE)
+        except Exception as e:
+            logger.warning(f"Could not save state: {e}")
 
-def password_needs_rehash(stored: str) -> bool:
-    return bool(stored) and not stored.startswith("$argon2id$")
 
-# The first-run password is always chosen by the operator in the web UI.
-# There is intentionally no built-in/default credential, even for localhost.
-# Until the operator completes setup, authentication remains disabled and the
-# login page becomes a one-time password setup screen. Only the Argon2id hash
-# is stored in the database.
-AUTH = {"password_hash": "", "setup_required": True}
+# ── Debounced save ─────────────────────────────────────────────────────────────
+# هر بار که یک کانکشن (trojan/vless/shadowsocks/xhttp) بسته میشه، schedule_save()
+# صدا زده میشه به‌جای save_state() مستقیم. اگه صدها کانکشن در ثانیه باز و بسته بشن
+# (که برای WebSocket-based transportها عادیه)، save_state() قبلی باعث میشد به همون
+# تعداد، کل state سریالایز و روی دیسک نوشته بشه و event loop تک‌هسته‌ای رو مسدود کنه.
+# اینجا چندین درخواست ذخیره‌سازی که در بازه‌ی SAVE_DEBOUNCE_SECONDS اتفاق بیفتن،
+# در یک نوشتن واحد روی دیسک ادغام میشن.
+SAVE_DEBOUNCE_SECONDS = 2.0
+_save_pending = False
+_save_dirty_again = False
 
-async def _bootstrap_admin_password(settings_map: dict[str, str]) -> None:
-    stored_hash = settings_map.get("password_hash")
-    if stored_hash:
-        AUTH["password_hash"] = stored_hash
-        AUTH["setup_required"] = False
+
+async def schedule_save():
+    """نسخه‌ی debounce شده‌ی save_state — برای صدا زدن مکرر و پرتعداد (هر بسته شدن کانکشن) امن است."""
+    global _save_pending, _save_dirty_again
+    if _save_pending:
+        _save_dirty_again = True
         return
+    _save_pending = True
+    try:
+        while True:
+            _save_dirty_again = False
+            await asyncio.sleep(SAVE_DEBOUNCE_SECONDS)
+            await save_state()
+            if not _save_dirty_again:
+                break
+    finally:
+        _save_pending = False
 
-    # On ephemeral deployments, an operator can pin the admin password in a
-    # Railway/host secret.  The secret is never written to logs or returned by
-    # the API; only its Argon2id hash is persisted.
-    bootstrap_password = CONFIG.get("admin_password", "")
-    if bootstrap_password:
-        err = _password_strength_error(bootstrap_password)
-        if err is None:
-            new_hash = hash_password(bootstrap_password)
-            await _db_set_setting("password_hash", new_hash)
-            AUTH["password_hash"] = new_hash
-            AUTH["setup_required"] = False
-            logger.info("🔐 admin password bootstrapped from deployment secret")
+# ── In-memory state ───────────────────────────────────────────────────────────
+connections: dict = {}
+stats = {
+    "total_bytes": 0,
+    "total_requests": 0,
+    "total_errors": 0,
+    "start_time": time.time(),
+}
+class _ErrorLogDeque(deque):
+    """deque معمولی، با این تفاوت که وقتی توقف لاگ‌گیری فعال باشه append() هیچ کاری
+    نمی‌کنه. با این روش همه‌ی error_logs.append(...) های پخش‌شده توی پروژه
+    (websocket.py ها، xhttp_core.py ها و ...) بدون نیاز به تغییر خودشون از این
+    فلگ پیروی می‌کنن."""
+    def append(self, item):
+        if CONFIG.get("disable_logging"):
             return
-        logger.error("ADMIN_PASSWORD is configured but invalid: %s", err)
+        super().append(item)
 
-    AUTH["password_hash"] = ""
-    AUTH["setup_required"] = True
 
-SESSION_COOKIE = "vortex_session"
-CSRF_COOKIE = "vortex_csrf"
-CSRF_HEADER = "x-csrf-token"
-SESSION_TTL = 60 * 60 * 24 * 7  # 7 روز
+error_logs: deque = _ErrorLogDeque(maxlen=50)
+activity_logs: deque = deque(maxlen=200)
+hourly_traffic: dict = defaultdict(int)
+http_client: httpx.AsyncClient | None = None
+LINKS: dict = {}
+LINKS_LOCK = asyncio.Lock()
+SUBS: dict = {}
+SUBS_LOCK = asyncio.Lock()
+
+# ── MTProto (mtproto_native / باینری رسمی تلگرام) — هر لینک = یک پروسه‌ی جدا،
+# روی پورت خودش، با ad_tag مستقل خودش (per-instance، دقیقاً مثل mtg قدیم) ──
+
+# ── Node linking (اتصال چند پنل به هم) ────────────────────────────────────────
+# NODE_KEYS: کلیدهایی که *این* پنل صادر کرده. هر کلید به یک پنل دیگه اجازه میده
+#            دیتای این پنل رو بخونه و روی کانفیگ‌هاش بنویسه (سمت inbound).
+# NODES:     پنل‌هایی که *این* پنل بهشون وصل شده و دیتاشون رو ادغام می‌کنه (سمت outbound).
+NODE_KEYS: dict = {}
+NODE_KEYS_LOCK = asyncio.Lock()
+NODES: dict = {}
+NODES_LOCK = asyncio.Lock()
+_NODE_CACHE: dict = {}          # node_id -> {"at": float, "data": dict}
+NODE_CACHE_TTL = 8.0
+NODE_KEY_PREFIX = "rvg-"
+NODE_KEY_HEADER = "X-RVG-Node-Key"
+NODE_SHARE_PARTS = ("usage", "links", "subs", "requests", "logs")
+
+PROTOCOLS = (
+    "vless-ws", "xhttp-packet-up", "xhttp-stream-up",
+    "trojan-ws", "trojan-xhttp-packet-up", "trojan-xhttp-stream-up",
+    "mtproto", "shadowsocks",
+)
+DEFAULT_PROTOCOL = "vless-ws"
+
+def log_activity(kind: str, message: str, level: str = "info"):
+    activity_logs.append({
+        "kind": kind,
+        "level": level,
+        "message": message,
+        "time": datetime.now().isoformat(),
+    })
+
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+SESSION_COOKIE = "rvg_session"
+SESSION_TTL = 60 * 60 * 24 * 7
+
+def hash_password(pw: str) -> str:
+    return hashlib.sha256(f"{pw}{CONFIG['secret']}".encode()).hexdigest()
+
+AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "123456"))}
 SESSIONS: dict = {}
 SESSIONS_LOCK = asyncio.Lock()
 
-# ───────────────────────── Login brute-force protection ─────────────────────────
-
-LOGIN_ATTEMPTS: dict = {}  # ip -> {"count": int, "locked_until": float}
-LOGIN_LOCK = asyncio.Lock()
-LOGIN_GLOBAL_EVENTS: deque[float] = deque()
-MAX_GLOBAL_LOGIN_ATTEMPTS = 30
-GLOBAL_LOGIN_WINDOW = 60
-MAX_ATTEMPTS = 5
-LOCKOUT_SECONDS = 5 * 60
-
-
-async def check_login_allowed(ip: str) -> tuple[bool, int]:
-    now = time.time()
-    if redis_client is not None:
-        key = hashlib.sha256(ip.encode()).hexdigest()
-        lock_key = f"vortex:login:lock:{key}"
-        ttl = await redis_client.ttl(lock_key)
-        if ttl and ttl > 0:
-            return False, int(ttl)
-        global_key = "vortex:login:global"
-        count = await redis_client.get(global_key)
-        if count and int(count) >= MAX_GLOBAL_LOGIN_ATTEMPTS:
-            ttl = await redis_client.ttl(global_key)
-            return False, max(1, int(ttl))
-        return True, 0
-    async with LOGIN_LOCK:
-        while LOGIN_GLOBAL_EVENTS and LOGIN_GLOBAL_EVENTS[0] <= now - GLOBAL_LOGIN_WINDOW:
-            LOGIN_GLOBAL_EVENTS.popleft()
-        if len(LOGIN_GLOBAL_EVENTS) >= MAX_GLOBAL_LOGIN_ATTEMPTS:
-            return False, max(1, int(LOGIN_GLOBAL_EVENTS[0] + GLOBAL_LOGIN_WINDOW - now))
-        rec = LOGIN_ATTEMPTS.get(ip)
-        if not rec:
-            return True, 0
-        if rec["locked_until"] and rec["locked_until"] > now:
-            return False, int(rec["locked_until"] - now)
-        return True, 0
-
-async def record_login_failure(ip: str):
-    if redis_client is not None:
-        key = hashlib.sha256(ip.encode()).hexdigest()
-        count_key = f"vortex:login:fail:{key}"
-        lock_key = f"vortex:login:lock:{key}"
-        global_key = "vortex:login:global"
-        pipe = redis_client.pipeline()
-        pipe.incr(count_key)
-        pipe.expire(count_key, LOCKOUT_SECONDS)
-        pipe.incr(global_key)
-        pipe.expire(global_key, GLOBAL_LOGIN_WINDOW)
-        vals = await pipe.execute()
-        if int(vals[0]) >= MAX_ATTEMPTS:
-            await redis_client.set(lock_key, "1", ex=LOCKOUT_SECONDS)
-        return
-    async with LOGIN_LOCK:
-        LOGIN_GLOBAL_EVENTS.append(time.time())
-        rec = LOGIN_ATTEMPTS.setdefault(ip, {"count": 0, "locked_until": 0})
-        rec["count"] += 1
-        if rec["count"] >= MAX_ATTEMPTS:
-            rec["locked_until"] = time.time() + LOCKOUT_SECONDS
-            rec["count"] = 0
-
-async def record_login_success(ip: str):
-    if redis_client is not None:
-        key = hashlib.sha256(ip.encode()).hexdigest()
-        await redis_client.delete(f"vortex:login:fail:{key}", f"vortex:login:lock:{key}")
-        return
-    async with LOGIN_LOCK:
-        LOGIN_ATTEMPTS.pop(ip, None)
-
-def _trusted_proxy_networks() -> list[ipaddress._BaseNetwork]:
-    networks = []
-    for raw in CONFIG["trusted_proxy_cidrs"]:
-        try:
-            networks.append(ipaddress.ip_network(raw, strict=False))
-        except ValueError:
-            logger.warning("Ignoring invalid TRUSTED_PROXY_CIDRS entry: %s", raw)
-    return networks
-
-
-TRUSTED_PROXY_NETWORKS = _trusted_proxy_networks()
-
-
-def client_ip(request: Request) -> str:
-    peer = request.client.host if request.client else "unknown"
-    if not CONFIG["trust_proxy"] or not TRUSTED_PROXY_NETWORKS:
-        return peer
-    try:
-        peer_ip = ipaddress.ip_address(peer)
-    except ValueError:
-        return peer
-    if not any(peer_ip in net for net in TRUSTED_PROXY_NETWORKS):
-        return peer
-    values = [p.strip() for p in request.headers.get("x-forwarded-for", "").split(",") if p.strip()]
-    values.append(peer)
-    for value in reversed(values):
-        try:
-            ip = ipaddress.ip_address(value)
-        except ValueError:
-            continue
-        if not any(ip in net for net in TRUSTED_PROXY_NETWORKS):
-            return str(ip)
-    return peer
-
-
 async def create_session() -> str:
     token = secrets.token_urlsafe(32)
-    expires = int(SESSION_TTL)
-    if redis_client is not None:
-        await redis_client.setex(f"vortex:session:{token}", expires, "1")
-    else:
-        async with SESSIONS_LOCK:
-            SESSIONS[token] = time.time() + SESSION_TTL
+    async with SESSIONS_LOCK:
+        SESSIONS[token] = time.time() + SESSION_TTL
     return token
 
 async def is_valid_session(token: str | None) -> bool:
     if not token:
         return False
-    if redis_client is not None:
-        return bool(await redis_client.exists(f"vortex:session:{token}"))
     async with SESSIONS_LOCK:
         exp = SESSIONS.get(token)
         if exp is None:
@@ -1297,9 +296,6 @@ async def is_valid_session(token: str | None) -> bool:
 async def destroy_session(token: str | None):
     if not token:
         return
-    if redis_client is not None:
-        await redis_client.delete(f"vortex:session:{token}")
-        return
     async with SESSIONS_LOCK:
         SESSIONS.pop(token, None)
 
@@ -1309,2884 +305,2567 @@ async def require_auth(request: Request):
         raise HTTPException(status_code=401, detail="unauthorized")
     return token
 
-
-def csrf_token_for_session(session_token: str) -> str:
-    # به‌جای نگه‌داشتن یک جدول جدای CSRF token، مقدار آن را قطعی (deterministic)
-    # از خودِ session token با HMAC می‌سازیم — یعنی نیازی به state اضافه نیست
-    # و با هر ری‌استارت سرویس (که INSTANCE_SECRET عوض می‌شود و سشن‌های قدیمی
-    # هم چون در حافظه بودند از بین رفته‌اند) به‌طور خودکار sync می‌ماند.
-    return hmac.new(CSRF_SECRET, f"csrf:{session_token}".encode(), hashlib.sha256).hexdigest()
-
-
-async def require_auth_csrf(request: Request):
-    """مثل require_auth، به‌علاوه‌ی بررسی CSRF token برای متدهای تغییردهنده‌ی
-    وضعیت (POST/PUT/PATCH/DELETE).
-
-    چون کوکی سشن httponly است و کوکی CSRF نیست، فقط جاوااسکریپتِ همان
-    origin می‌تواند مقدار کوکی CSRF را بخواند و به‌عنوان هدر بفرستد — یک
-    سایتِ ثالث که کاربر لاگین‌شده را به این پنل هدایت می‌کند (CSRF کلاسیک)
-    نمی‌تواند این هدر را بسازد، چون به کوکی CSRF (که SameSite هم هست)
-    دسترسی ندارد. این یک لایه‌ی دفاعی اضافه روی SameSite=Lax است، نه
-    جایگزین آن.
-    """
-    token = request.cookies.get(SESSION_COOKIE)
-    if not await is_valid_session(token):
-        raise HTTPException(status_code=401, detail="unauthorized")
-    expected = csrf_token_for_session(token)
-    provided = request.headers.get(CSRF_HEADER, "")
-    if not provided or not hmac.compare_digest(expected, provided):
-        raise HTTPException(status_code=403, detail="CSRF token missing or invalid")
-    return token
-
-
-
-def _db_integrity_check_sync():
-    conn = _db_connect()
-    try:
-        row = conn.execute("PRAGMA integrity_check").fetchone()
-        if not row or row[0] != "ok":
-            raise RuntimeError(f"sqlite integrity check failed: {row}")
-    finally:
-        conn.close()
-
-
-def _db_quick_ping_sync():
-    # برخلاف _db_integrity_check_sync (که PRAGMA integrity_check اجرا می‌کند
-    # و کل فایل دیتابیس را اسکن می‌کند)، این فقط تأیید می‌کند که می‌شود به
-    # دیتابیس وصل شد و یک کوئری ساده اجرا کرد — برای صدا زدن مکرر (هر
-    # درخواست health-check) طراحی شده، نه برای بررسی سلامت کامل فایل.
-    conn = _db_connect()
-    try:
-        conn.execute("SELECT 1").fetchone()
-    finally:
-        conn.close()
-
-# ───────────────────────── Startup / shutdown ─────────────────────────
-
-_cleanup_task: asyncio.Task | None = None
-
-
-async def _periodic_cleanup():
-    """سشن‌های منقضی‌شده و رکوردهای قفلِ لغوشده‌ی ورود را هر چند دقیقه پاک می‌کند.
-
-    قبلاً این‌ها فقط هنگام دسترسی مجدد (lazy) پاک می‌شدند؛ توکن‌هایی که هیچ‌وقت
-    دوباره استفاده نمی‌شوند برای همیشه در حافظه می‌ماندند و در یک دیپلوی
-    طولانی‌مدت رشد می‌کردند.
-    """
-    while True:
-        try:
-            await asyncio.sleep(600)
-            now = time.time()
-            async with SESSIONS_LOCK:
-                expired = [t for t, exp in SESSIONS.items() if exp < now]
-                for t in expired:
-                    SESSIONS.pop(t, None)
-            async with LOGIN_LOCK:
-                stale = [
-                    ip for ip, rec in LOGIN_ATTEMPTS.items()
-                    if rec["locked_until"] < now and rec["count"] == 0
-                ]
-                for ip in stale:
-                    LOGIN_ATTEMPTS.pop(ip, None)
-        except asyncio.CancelledError:
-            break
-        except Exception as exc:
-            logger.error("periodic cleanup error: %s", exc)
-
-
-from contextlib import asynccontextmanager
-
-def validate_runtime_config() -> None:
-    positive_limits = (
-        "max_ws_initial_bytes", "max_connections_per_ip",
-        "max_connections_global", "max_http_body_bytes", "max_login_body_bytes",
-        "proxy_max_response_bytes", "proxy_max_url_length",
+# ── Startup / Shutdown ────────────────────────────────────────────────────────
+@app.on_event("startup")
+async def startup():
+    asyncio.create_task(central.heartbeat_loop())
+    global http_client
+    limits = httpx.Limits(max_connections=500, max_keepalive_connections=100)
+    timeout = httpx.Timeout(30.0, connect=10.0)
+    http_client = httpx.AsyncClient(
+        limits=limits, timeout=timeout, follow_redirects=True,
     )
-    for key in positive_limits:
-        if CONFIG[key] <= 0:
-            raise RuntimeError(f"invalid configuration: {key} must be > 0")
-    if CONFIG["proxy_require_allowlist"] and not CONFIG["proxy_allowlist"]:
-        logger.info("HTTP proxy is fail-closed: PROXY_ALLOWED_DOMAINS is empty")
-    if CONFIG["trust_proxy"] and not TRUSTED_PROXY_NETWORKS:
-        raise RuntimeError("TRUST_PROXY=1 requires TRUSTED_PROXY_CIDRS")
-    if CONFIG["redis_url"] and not CONFIG["session_secret"]:
-        raise RuntimeError("REDIS_URL is set: SESSION_SECRET must also be configured for multi-instance CSRF/session consistency")
-    if any(port < 1 or port > 65535 for port in CONFIG["tunnel_allowed_ports"]):
-        raise RuntimeError("invalid TUNNEL_ALLOWED_PORTS")
+    await load_state()
+    await _restart_mtproto_instances()
+    log_activity("system", "سرور راه‌اندازی شد", "ok")
+    logger.info(f"RVG Gateway v9.2 started on port {CONFIG['port']}")
 
-
-@asynccontextmanager
-async def lifespan(_app: FastAPI):
-    global http_client, _cleanup_task, _usage_flush_task, redis_client
-    validate_runtime_config()
-    _db_init()
-    # PRAGMA integrity_check یک اسکن کامل روی کل فایل SQLite است — جای
-    # درستش اینجاست (یک‌بار، موقع بالاآمدن)، نه توی /health/ready که هم
-    # Docker HEALTHCHECK هر ۳۰ ثانیه صدایش می‌زند هم خودِ Railway به‌طور
-    # دوره‌ای. قبلاً همان اسکن سنگین روی هر درخواست health-check اجرا
-    # می‌شد؛ با رشد دیتابیس (لینک‌ها/لاگ‌های بیشتر) این می‌توانست گاهی از
-    # timeout پنج‌ثانیه‌ای Docker/Railway بگذرد و باعث شود health-check
-    # به‌اشتباه failed اعلام شود و کانتینر بی‌دلیل ری‌استارت بخورد.
-    await asyncio.to_thread(_db_integrity_check_sync)
-    # Fail fast on an unusable persistent volume instead of starting a
-    # half-working gateway that silently loses control-plane state.
-    storage = await asyncio.to_thread(_storage_status_sync)
-    if not storage["writable"]:
-        raise RuntimeError(f"database directory is not writable: {storage['db_path']}")
-    if (storage.get("railway") and storage.get("persistent_path")
-            and CONFIG["require_persistent_volume"] and not storage.get("volume_mounted")):
-        raise RuntimeError(
-            "Railway persistent storage is required: /data is not mounted as a Volume. "
-            "Create/attach a Railway Volume at /data before deploying. "
-            "Set REQUIRE_PERSISTENT_VOLUME=0 only if you intentionally accept ephemeral storage."
-        )
-    if CONFIG["redis_url"]:
-        if redis_async is None:
-            raise RuntimeError("REDIS_URL is set but redis package is not installed")
-        redis_client = redis_async.from_url(CONFIG["redis_url"], decode_responses=True)
-        await redis_client.ping()
-
-    link_rows, setting_rows = await _db_load_all()
+async def _restart_mtproto_instances():
+    """بعد از بالا اومدن پنل، به‌ازای هر لینک MTProto فعال یک پروسه‌ی جدای
+    mtproto_native (باینری رسمی تلگرام) روی پورت خودش بالا می‌آره."""
     async with LINKS_LOCK:
-        LINKS.clear()
-        SUBSCRIPTION_INDEX.clear()
-        for uuid, label, limit_bytes, used_bytes, created_at, active, expires_at, speed_limit_bps, subscription_token, route_via in link_rows:
-            token = subscription_token or secrets.token_urlsafe(32)
-            LINKS[uuid] = {
-                "label": label, "limit_bytes": limit_bytes, "used_bytes": used_bytes,
-                "created_at": created_at, "active": bool(active), "expires_at": expires_at,
-                "speed_limit_bps": speed_limit_bps or 0,
-                "subscription_token": token,
-                "route_via": route_via if route_via in ("auto", "railway", "cloudflare") else "auto",
-            }
-            SUBSCRIPTION_INDEX[token] = uuid
-    global ACTIVE_WORKER_URL
-    settings_map = dict(setting_rows)
-    ACTIVE_WORKER_URL = settings_map.get("cloudflare_worker_url", "") or ""
-    await _bootstrap_admin_password(settings_map)
+        targets = [
+            (uid, d) for uid, d in LINKS.items()
+            if d.get("protocol") == "mtproto" and d.get("active", True)
+        ]
+    if targets and not bottokentcpproxy.has_saved_token():
+        logger.error(
+            f"⚠️ {len(targets)} لینک MTProto وجود دارد ولی توکن Railway ذخیره نشده — "
+            f"هیچ TCP Proxy عمومی ساخته/بازسازی نمی‌شود و این لینک‌ها از بیرون کار نمی‌کنند. "
+            f"(اگر قبلاً توکن را وارد کرده بودید، یعنی دایرکتوری DATA_DIR بین دیپلوی‌ها "
+            f"پاک می‌شود و باید یک Volume پایدار روی Railway بهش وصل کنید.)"
+        )
+    for uid, d in targets:
+        try:
+            inst = await mtproto.start_instance(
+                uid,
+                secret=d.get("mtproto_secret"),
+                domain=d.get("mtproto_domain", mtproto.DEFAULT_FAKE_TLS_DOMAIN),
+                preferred_port=d.get("mtproto_port"),
+                force_port=d.get("mtproto_manual_port", False),
+                ad_tag=d.get("ad_tag"),
+            )
+        except Exception as exc:
+            logger.error(f"MTProto[{uid[:8]}]: راه‌اندازی ناموفق بود: {exc}\n{traceback.format_exc()}")
+            continue
 
-    global ADS_BLOCK_ENABLED, ADS_BLOCK_CUSTOM_DOMAINS
-    ADS_BLOCK_ENABLED = settings_map.get("ads_block_enabled") == "1"
+        old_port = d.get("mtproto_port")
+        async with LINKS_LOCK:
+            if uid in LINKS:
+                LINKS[uid]["mtproto_port"] = inst["port"]
+                LINKS[uid]["mtproto_secret"] = inst["secret"]
+
+        if (d.get("mtproto_proxy_id") and inst["port"] != old_port
+                and not d.get("mtproto_manual_port", False)):
+            asyncio.create_task(_reattach_mtproto_public_proxy(
+                uid, inst["port"], d.get("mtproto_proxy_id"), d.get("label", "")
+            ))
+        elif not d.get("mtproto_proxy_id") and bottokentcpproxy.has_saved_token():
+            # لینکی که هنوز هیچ TCP Proxy عمومی نداره (مثلاً چون با نسخه‌ی قدیمی
+            # ساخته شده) — بدون این، لینکش مرده می‌مونه.
+            asyncio.create_task(_attach_mtproto_public_proxy(
+                uid, inst["port"], d.get("label", "")
+            ))
+
+
+async def _mtproto_usage_callback(uuid: str, n_bytes: int) -> bool:
+    async with LINKS_LOCK:
+        link = LINKS.get(uuid)
+        if link is None:
+            return False
+        if not is_link_allowed(link):
+            return False
+        link["used_bytes"] += n_bytes
+        stats["total_bytes"] += n_bytes
+        hourly_traffic[now_ir().strftime("%H:00")] += n_bytes
+    return True
+
+mtproto.set_usage_callback(_mtproto_usage_callback)
+
+
+async def _attach_mtproto_public_proxy(uid: str, application_port: int, label: str):
+    """TCP Proxy عمومی روی Railway برای پورت این instance خاص می‌سازه (هر لینک
+    پورت جدای خودش رو داره، پس هرکدوم TCP Proxy جدای خودش رو لازم داره)."""
     try:
-        custom_raw = json.loads(settings_map.get("ads_block_custom_domains") or "[]")
-        ADS_BLOCK_CUSTOM_DOMAINS = {_normalize_ad_domain(d) for d in custom_raw if isinstance(d, str) and d.strip()}
-    except (json.JSONDecodeError, TypeError):
-        ADS_BLOCK_CUSTOM_DOMAINS = set()
+        pub = await bottokentcpproxy.create_public_proxy_for_port(application_port)
+    except Exception as exc:
+        logger.warning(f"TCP Proxy عمومی برای {uid[:8]} ناموفق بود: {exc}")
+        log_activity("link", f"ساخت TCP Proxy عمومی برای «{label}» ناموفق بود: {exc}", "err")
+        return
+    async with LINKS_LOCK:
+        if uid in LINKS:
+            LINKS[uid]["mtproto_public_host"] = pub["domain"]
+            LINKS[uid]["mtproto_public_port"] = pub["port"]
+            LINKS[uid]["mtproto_proxy_id"] = pub["id"]
+            LINKS[uid]["mtproto_public_pending"] = False
+    asyncio.create_task(save_state())
+    log_activity("link", f"TCP Proxy عمومی «{label}» آماده شد ({pub['domain']}:{pub['port']})", "ok")
 
-    scheme = "https" if cookie_secure() else "http"
-    panel_host = get_host()
-    display_host = f"{panel_host}" if cookie_secure() else f"{panel_host}:{CONFIG['port']}"
-    panel_url = f"{scheme}://{display_host}/login"
-    logger.info("🌀 پنل Vortex در آدرس زیر در دسترس است: %s", panel_url)
 
-    limits = httpx.Limits(max_connections=300, max_keepalive_connections=50)
-    timeout = httpx.Timeout(20.0, connect=8.0)
-    http_client = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=False)
-    await ensure_default_link()
-    _cleanup_task = asyncio.create_task(_periodic_cleanup())
-    _usage_flush_task = asyncio.create_task(_periodic_usage_flush())
-    global _AUTO_BACKUP_TASK
-    if _AUTO_BACKUP_TASK is None or _AUTO_BACKUP_TASK.done():
-        _AUTO_BACKUP_TASK = asyncio.create_task(_automatic_sqlite_backup())
-    logger.info("🌀 %s v%s started on port %s (%d links)", APP_NAME, APP_VERSION, CONFIG["port"], len(LINKS))
+
+async def _reattach_mtproto_public_proxy(uid: str, new_port: int, old_proxy_id: Optional[str], label: str):
+    if old_proxy_id:
+        await bottokentcpproxy.delete_public_proxy(old_proxy_id)
+    await _attach_mtproto_public_proxy(uid, new_port, label)
+
+
+async def _update_mtproto_ad_tag(uuid: str, ad_tag: str):
+    """پروسه‌ی این کاربر رو stop/start می‌کنه تا ad_tag جدید (که -P هست، سطح
+    process، نه runtime-API) اعمال بشه. force_port=True چون تازه stop شده و
+    پورت قدیمی باید آزاد باشه؛ اگه بازم آزاد نشد، پورت جدید می‌گیره و TCP Proxy
+    عمومی رو دوباره به پورت جدید وصل می‌کنیم."""
     try:
-        yield
-    finally:
-        await _flush_usage()
-        if _cleanup_task:
-            _cleanup_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await _cleanup_task
-        if _usage_flush_task:
-            _usage_flush_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await _usage_flush_task
-        await _graceful_shutdown()
-        if http_client:
-            await http_client.aclose()
-        if redis_client:
-            await redis_client.aclose()
+        async with LINKS_LOCK:
+            link = LINKS.get(uuid)
+            if not link:
+                return
+            label = link.get("label", "")
+            secret = link.get("mtproto_secret")
+            domain = link.get("mtproto_domain", mtproto.DEFAULT_FAKE_TLS_DOMAIN)
+            old_port = link.get("mtproto_port")
+            old_proxy_id = link.get("mtproto_proxy_id")
+            manual_port = link.get("mtproto_manual_port", False)
+            if not secret:
+                logger.error(f"MTProto[{uuid[:8]}]: سکرت پیدا نشد")
+                return
 
-app.router.lifespan_context = lifespan
+        await mtproto.stop_instance(uuid)
+        try:
+            inst = await mtproto.start_instance(
+                uuid,
+                secret=secret,
+                domain=domain,
+                preferred_port=old_port,
+                force_port=True,
+                ad_tag=ad_tag,
+            )
+        except RuntimeError as exc:
+            logger.warning(f"ad_tag ناموفق بود ({exc})، تلاش با پورت جدید...")
+            inst = await mtproto.start_instance(
+                uuid,
+                secret=secret,
+                domain=domain,
+                preferred_port=None,
+                force_port=False,
+                ad_tag=ad_tag,
+            )
+
+        async with LINKS_LOCK:
+            link = LINKS.get(uuid)
+            if not link:
+                asyncio.create_task(mtproto.stop_instance(uuid))
+                return
+            link["mtproto_port"] = inst["port"]
+            link["mtproto_secret"] = inst["secret"]
+            link["mtproto_domain"] = inst["domain"]
+            link["ad_tag"] = ad_tag
+            link["ad_tag_status"] = "done"
+            link["ad_tag_link"] = generate_share_link(
+                uuid, get_host(), remark=f"RVG-{link.get('label','')}", protocol="mtproto"
+            )
+
+        if inst["port"] != old_port and old_proxy_id and not manual_port:
+            asyncio.create_task(_reattach_mtproto_public_proxy(
+                uuid, inst["port"], old_proxy_id, label
+            ))
+
+        asyncio.create_task(save_state())
+        logger.info(
+            f"MTProto[{uuid[:8]}]: ad_tag به‌روز شد، instance ری‌استارت شد "
+            f"(پورت: {old_port} -> {inst['port']})"
+        )
+        log_activity("link", f"تبلیغ کانال برای «{label}» با موفقیت اعمال شد", "ok")
+
+    except Exception as exc:
+        logger.error(f"خطا در به‌روزرسانی ad_tag برای {uuid[:8]}: {exc}")
+        async with LINKS_LOCK:
+            if uuid in LINKS:
+                LINKS[uuid]["ad_tag_status"] = "error"
+        log_activity("link", f"به‌روزرسانی ad_tag برای «{LINKS.get(uuid,{}).get('label','')}» ناموفق بود", "err")
+        asyncio.create_task(save_state())
 
 
-# ───────────────────────── Helpers ─────────────────────────
+@app.on_event("shutdown")
+async def shutdown():
+    await save_state()
+    await mtproto.stop_all()
+    if http_client:
+        await http_client.aclose()
 
-def generate_uuid(seed: str | None = None) -> str:
-    if seed is None:
-        raw = secrets.token_bytes(16).hex()
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def get_host() -> str:
+    return os.environ.get("RAILWAY_PUBLIC_DOMAIN", CONFIG["host"])
+
+def generate_uuid() -> str:
+    h = secrets.token_hex(16)
+    return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+
+def now_ir() -> datetime:
+    return datetime.now(IRAN_TZ)
+
+def generate_share_link(uuid: str, host: str, remark: str = "RVG", protocol: str = DEFAULT_PROTOCOL) -> str:
+    link = LINKS.get(uuid) or {}
+    alpn = link.get("alpn", "h2")
+    fp = link.get("fingerprint", "chrome")
+
+    if protocol == "mtproto":
+        secret = link.get("mtproto_secret")
+        if not secret:
+            return f"tg://proxy?server={host}&port=0&secret=not_ready#{quote(remark)}"
+        # مهم: برای MTProto هیچ‌وقت به دامنه‌ی پنل fallback نمی‌کنیم. دامنه‌ی اصلی
+        # Railway فقط HTTP/443 رو سرو می‌کنه و پورت داخلی (مثلاً 8477) از بیرون
+        # اصلاً باز نیست — چنین لینکی کاملاً مرده‌ست (نه پینگ می‌ده نه وصل می‌شه).
+        # تنها آدرس معتبر، دامنه/پورتی هست که Railway موقع ساخت TCP Proxy می‌ده.
+        pub_host = link.get("mtproto_public_host")
+        pub_port = link.get("mtproto_public_port")
+        if not pub_host or not pub_port:
+            return f"tg://proxy?server={host}&port=0&secret=not_ready#{quote(remark)}"
+        return mtproto.generate_mtproto_link(
+            pub_host, pub_port, secret,
+            mtproto.sanitize_domain(link.get("mtproto_domain"))
+        )
+
+    if protocol == "shadowsocks":
+        cipher = link.get("ss_cipher", DEFAULT_CIPHER)
+        password = link.get("ss_password", "")
+        return generate_ss_link(host, 443, cipher, password, remark)
+
+    if protocol == "trojan-ws":
+        params = {
+            "security": "tls", "type": "ws", "host": host,
+            "path": "/trojan-ws", "sni": host, "fp": fp, "alpn": alpn,
+        }
+        query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
+        return f"trojan://{uuid}@{host}:443?{query}#{quote(remark)}"
+
+    if protocol.startswith("trojan-xhttp-"):
+        mode = protocol.replace("trojan-xhttp-", "")
+        path = f"/txhttp-siz10/{mode}/{uuid}"
+        params = {
+            "security": "tls", "type": "xhttp", "mode": mode, "host": host,
+            "path": path, "sni": host, "fp": fp, "alpn": alpn,
+        }
+        query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
+        return f"trojan://{uuid}@{host}:443?{query}#{quote(remark)}"
+
+    if protocol == "vless-ws":
+        path = f"/ws/{uuid}"
+        params = {
+            "encryption": "none",
+            "security": "tls",
+            "type": "ws",
+            "host": host,
+            "path": path,
+            "sni": host,
+            "fp": fp,
+            "alpn": alpn,
+        }
     else:
-        raw = hmac.new(INSTANCE_SECRET, seed.encode(), hashlib.sha256).hexdigest()[:32]
-    return f"{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:32]}"
-
-
-def _link_route_via(uid: str) -> str:
-    """کاربر می‌تواند برای هر لینک جداگانه مسیر تولید کانفیگ را انتخاب کند:
-    'auto' (پیش‌فرض: اگر Worker فعال باشد از آن استفاده کن، وگرنه مستقیم Railway)،
-    'railway' (همیشه مستقیم، حتی اگر Worker فعال باشد) یا
-    'cloudflare' (همیشه از Worker؛ اگر Worker هنوز دیپلوی نشده باشد به auto سقوط می‌کند)."""
-    value = (LINKS.get(uid, {}).get("route_via") or "auto").strip().lower()
-    return value if value in ("auto", "railway", "cloudflare") else "auto"
-
-
-def generate_vless_link(uid: str, host: str, remark: str = "Vortex") -> str:
-    route_via = _link_route_via(uid)
-    worker_parts = _worker_endpoint_parts() if route_via != "railway" else None
-    if worker_parts:
-        endpoint_host, gate_path = worker_parts
-        link_host = endpoint_host
-        path = f"{gate_path}/tunnel/{uid}"
-    else:
-        link_host = host
-        # Direct Railway VLESS compatibility: use the canonical /ws/{uuid}
-        # endpoint used by the known-working reference project.
-        # Cloudflare Worker links keep /tunnel/ because the Worker forwards
-        # that path explicitly.
-        path = f"/ws/{uid}"
-    params = {
-        "encryption": "none",
-        "security": "tls",
-        "type": "ws",
-        "host": link_host,
-        "path": path,
-        "sni": link_host,
-        "fp": "chrome",
-        "alpn": "http/1.1",
-    }
+        mode = protocol.replace("xhttp-", "")
+        path = f"/xhttp-siz10/{mode}/{uuid}"
+        params = {
+            "encryption": "none",
+            "security": "tls",
+            "type": "xhttp",
+            "mode": mode,
+            "host": host,
+            "path": path,
+            "sni": host,
+            "fp": fp,
+            "alpn": alpn,
+        }
     query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
-    return f"vless://{uid}@{link_host}:443?{query}#{quote(remark)}"
+    return f"vless://{uuid}@{host}:443?{query}#{quote(remark)}"
 
-
-def generate_sub_url(uid: str, host: str) -> str:
-    route_via = _link_route_via(uid)
-    worker_parts = _worker_endpoint_parts() if route_via != "railway" else None
-    if worker_parts:
-        endpoint_host, gate_path = worker_parts
-        token = LINKS.get(uid, {}).get("subscription_token", uid)
-        # Subscription endpoint is deliberately exposed through the Worker so
-        # the generated client URL remains usable even when the Railway origin
-        # is hidden behind Cloudflare.
-        return f"https://{endpoint_host}{gate_path}/sub/{token}"
-    base = get_public_origin() if not cookie_secure() else f"https://{get_host()}"
-    return f"{base}/sub/{LINKS.get(uid, {}).get('subscription_token', uid)}"
-
-def uptime_str() -> str:
+def uptime() -> str:
     secs = int(time.time() - stats["start_time"])
     h, m, s = secs // 3600, (secs % 3600) // 60, secs % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
 
-
 def parse_size_to_bytes(value: float, unit: str) -> int:
     unit = unit.upper()
-    mult = {"GB": 1024**3, "MB": 1024**2, "KB": 1024}.get(unit, 1)
-    return int(value * mult)
-
-
-def parse_speed_to_bps(value: float, unit: str) -> int:
-    """مقدار محدودیت سرعت (KB/s یا MB/s) را به بایت‌بر ثانیه تبدیل می‌کند."""
-    unit = (unit or "").upper()
-    mult = {"MBPS": 1024**2, "KBPS": 1024}.get(unit, 1024)
-    return max(0, int(value * mult))
-
-
-def parse_expiry_input(value) -> str | None:
-    """ورودی تاریخ انقضا (از input[type=date] مثل '2026-12-31') را به یک
-    ISO datetime تبدیل می‌کند که پایان همان روز را نشان می‌دهد، تا کاربر تا
-    آخر روزِ انتخاب‌شده بتواند از لینک استفاده کند. اگر خالی/نامعتبر باشد
-    None برمی‌گرداند (یعنی بدون انقضا)."""
-    if not value:
-        return None
-    value = str(value).strip()
-    if not value:
-        return None
-    try:
-        if "T" in value:
-            # از قبل یک ISO datetime کامل است (مثلاً از یک بکاپ یا PATCH قبلی)
-            datetime.fromisoformat(value)
-            return value
-        parsed_date = datetime.fromisoformat(value).date()
-        return datetime.combine(parsed_date, datetime.max.time().replace(microsecond=0)).isoformat()
-    except ValueError:
-        return None
-
+    if unit == "GB": return int(value * 1024 ** 3)
+    if unit == "MB": return int(value * 1024 ** 2)
+    if unit == "KB": return int(value * 1024)
+    return int(value)
 
 def is_link_expired(link: dict) -> bool:
     exp = link.get("expires_at")
     if not exp:
         return False
     try:
-        return datetime.fromisoformat(exp) <= datetime.now()
-    except ValueError:
+        return datetime.now() > datetime.fromisoformat(exp)
+    except Exception:
         return False
 
+def is_link_allowed(link: dict | None) -> bool:
+    if link is None:
+        return False
+    if not link.get("active", True):
+        return False
+    if is_link_expired(link):
+        return False
+    lb = link.get("limit_bytes", 0)
+    if lb > 0 and link.get("used_bytes", 0) >= lb:
+        return False
+    return True
 
-async def ensure_default_link():
-    created_uid = None
-    async with LINKS_LOCK:
-        if not LINKS:
-            uid = generate_uuid("default")
-            LINKS[uid] = {
-                "label": "لینک پیش‌فرض",
-                "limit_bytes": 0,
-                "used_bytes": 0,
-                "created_at": datetime.now().isoformat(),
-                "active": True,
-                "expires_at": None,
-                "speed_limit_bps": 0,
-                "subscription_token": secrets.token_urlsafe(32),
-                "route_via": "auto",
-            }
-            created_uid = uid
-    if created_uid:
-        await _db_upsert_link(created_uid, LINKS[created_uid])
+def fmt_bytes(b: int) -> str:
+    if b < 1024: return f"{b} B"
+    if b < 1024**2: return f"{b/1024:.1f} KB"
+    if b < 1024**3: return f"{b/1024**2:.2f} MB"
+    return f"{b/1024**3:.2f} GB"
+
+def build_sub_headers(label: str, used_bytes: int, limit_bytes: int, expires_at: str | None, support_url: str = "https://t.me/CodeBoxo") -> dict:
+    total = limit_bytes if limit_bytes > 0 else 0
+    expire_ts = 0
+    if expires_at:
+        try:
+            expire_ts = int(datetime.fromisoformat(expires_at).timestamp())
+        except Exception:
+            expire_ts = 0
+    userinfo = f"upload=0; download={used_bytes}; total={total}; expire={expire_ts}"
+    title_b64 = base64.b64encode(label.encode("utf-8")).decode()
+    return {
+        "profile-title": f"base64:{title_b64}",
+        "subscription-userinfo": userinfo,
+        "profile-update-interval": "6",
+        "support-url": support_url,
+    }
+
+def client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip.strip()
+    return request.client.host if request.client else "نامشخص"
+
+# ── Node linking helpers ──────────────────────────────────────────────────────
+def _b64u_encode(s: str) -> str:
+    return base64.urlsafe_b64encode(s.encode("utf-8")).decode().rstrip("=")
 
 
-# ───────────────────────── SSRF protection ─────────────────────────
+def _b64u_decode(s: str) -> str:
+    pad = "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s + pad).decode("utf-8")
 
-def _is_blocked_single(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    return (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_reserved
-        or ip.is_multicast
-        or ip.is_unspecified
+
+def build_node_key(host: str, secret: str) -> str:
+    """کلید خودکفا: دامنه‌ی این پنل داخل خودِ کلید کدگذاری میشه."""
+    return f"{NODE_KEY_PREFIX}{_b64u_encode(host)}.{secret}"
+
+
+def parse_node_key(key: str) -> tuple[str, str]:
+    """برمی‌گرداند (host, secret). در صورت نامعتبر بودن ValueError می‌دهد."""
+    key = (key or "").strip()
+    if not key.startswith(NODE_KEY_PREFIX):
+        raise ValueError("کلید باید با rvg- شروع شود")
+    body = key[len(NODE_KEY_PREFIX):]
+    if "." not in body:
+        raise ValueError("ساختار کلید نامعتبر است")
+    host_part, secret = body.split(".", 1)
+    if not secret:
+        raise ValueError("بخش سکرت کلید خالی است")
+    try:
+        host = _b64u_decode(host_part).strip()
+    except Exception:
+        raise ValueError("دامنه‌ی داخل کلید قابل خواندن نیست")
+    if not host or "/" in host or " " in host:
+        raise ValueError("دامنه‌ی داخل کلید نامعتبر است")
+    return host, secret
+
+
+def _node_scheme(host: str) -> str:
+    # فقط برای تست محلی http مجاز است؛ در بقیه‌ی موارد اجباراً https
+    return "http" if host.startswith(("localhost", "127.0.0.1")) else "https"
+
+
+def _normalize_node(n: dict) -> dict:
+    share = n.get("share") or {}
+    return {
+        "label": str(n.get("label") or n.get("host") or "نود")[:60],
+        "host": str(n.get("host") or ""),
+        "key": str(n.get("key") or ""),
+        "enabled": bool(n.get("enabled", True)),
+        "merge_dashboard": bool(n.get("merge_dashboard", True)),
+        "share": {p: bool(share.get(p, p != "logs")) for p in NODE_SHARE_PARTS},
+        "created_at": n.get("created_at") or datetime.now().isoformat(),
+        "last_sync_at": n.get("last_sync_at"),
+        "last_error": n.get("last_error"),
+        "peer_version": n.get("peer_version"),
+    }
+
+
+def _node_public(node_id: str, n: dict) -> dict:
+    """نسخه‌ی امن برای فرانت‌اند — کلید خام بیرون نمی‌رود."""
+    out = {k: v for k, v in n.items() if k != "key"}
+    out["node_id"] = node_id
+    out["key_preview"] = (n.get("key") or "")[:14] + "…"
+    return out
+
+
+async def _node_request(node: dict, method: str, path: str, *,
+                        params: dict | None = None,
+                        json_body: dict | None = None,
+                        timeout: float = 10.0) -> httpx.Response:
+    host = node["host"]
+    url = f"{_node_scheme(host)}://{host}{path}"
+    client = http_client or httpx.AsyncClient()
+    return await client.request(
+        method, url,
+        params=params, json=json_body,
+        headers={NODE_KEY_HEADER: node["key"]},
+        timeout=timeout, follow_redirects=False,
     )
 
 
-def is_blocked_ip(ip_str: str) -> bool:
+async def require_node_key(request: Request) -> str:
+    """احراز هویت پنل مقابل با هدر X-RVG-Node-Key (بدون کوکی سشن)."""
+    raw = (request.headers.get(NODE_KEY_HEADER) or "").strip()
+    if not raw:
+        raise HTTPException(status_code=401, detail="node key missing")
     try:
-        ip = ipaddress.ip_address(ip_str)
+        _, secret = parse_node_key(raw)
     except ValueError:
-        return True
+        raise HTTPException(status_code=401, detail="invalid node key")
+    matched = None
+    async with NODE_KEYS_LOCK:
+        for key_id, entry in NODE_KEYS.items():
+            if entry.get("revoked"):
+                continue
+            if secrets.compare_digest(str(entry.get("secret", "")), secret):
+                matched = key_id
+                break
+        if matched is None:
+            raise HTTPException(status_code=401, detail="unknown or revoked node key")
+        entry = NODE_KEYS[matched]
+        entry["last_used_at"] = datetime.now().isoformat()
+        entry["use_count"] = int(entry.get("use_count", 0)) + 1
+    asyncio.create_task(schedule_save())
+    return matched
 
-    if isinstance(ip, ipaddress.IPv6Address):
-        # نکته‌ی مهم (که با تست واحد پیدا شد): کتابخانه‌ی ipaddress پایتون
-        # کل بلوک ::ffff:0:0/96 (IPv4-mapped) را طبق ثبت IANA به‌عنوان
-        # «is_reserved=True» علامت می‌زند — چه IPv4 تعبیه‌شده در آن خصوصی
-        # باشد چه کاملاً عمومی (مثلاً ::ffff:8.8.8.8). یعنی اگر این‌جا
-        # اول چک عمومی روی خودِ پوسته‌ی IPv6 را انجام می‌دادیم (مثل قبل)،
-        # همه‌ی آدرس‌های IPv4-mapped همیشه مسدود می‌شدند حتی وقتی مقصد
-        # واقعاً عمومی و مجاز بود. برای این‌ها باید صرفاً بر اساس IPv4
-        # واقعیِ تعبیه‌شده تصمیم گرفت، نه پرچم‌های خودِ پوسته‌ی IPv6.
-        mapped = ip.ipv4_mapped
-        if mapped is not None:
-            return _is_blocked_single(mapped)
-        # آدرس‌های 6to4 (2002::/16) و Teredo (2001::/32) پرچم is_reserved
-        # ندارند، پس چک عمومیِ پایین (روی خودِ پوسته) به‌تنهایی برایشان کافی
-        # نیست چون IPv4 تعبیه‌شده در آن‌ها می‌تواند داخلی باشد بدون این‌که
-        # خودِ پوسته‌ی IPv6 private/reserved تشخیص داده شود.
-        embedded = getattr(ip, "sixtofour", None) or getattr(ip, "teredo", None)
-        if embedded is not None:
-            candidates = embedded if isinstance(embedded, tuple) else (embedded,)
-            for c in candidates:
-                if isinstance(c, ipaddress.IPv4Address) and _is_blocked_single(c):
-                    return True
+# ── Default link ──────────────────────────────────────────────────────────────
+_default_link_created = False
 
-    return _is_blocked_single(ip)
+async def ensure_default_link():
+    global _default_link_created
+    if _default_link_created:
+        return
+    async with LINKS_LOCK:
+        if not any(l.get("is_default") for l in LINKS.values()):
+            uid = hashlib.sha256(f"default{CONFIG['secret']}".encode()).hexdigest()
+            uid = f"{uid[:8]}-{uid[8:12]}-{uid[12:16]}-{uid[16:20]}-{uid[20:32]}"
+            if uid not in LINKS:
+                LINKS[uid] = {
+                    "label": "لینک پیش‌فرض",
+                    "limit_bytes": 0,
+                    "used_bytes": 0,
+                    "created_at": datetime.now().isoformat(),
+                    "active": True,
+                    "expires_at": None,
+                    "note": "",
+                    "is_default": True,
+                    "sub_id": None,
+                    "protocol": DEFAULT_PROTOCOL,
+                }
+                asyncio.create_task(save_state())
+        _default_link_created = True
 
-
-def _alt_ip_literal(hostname: str) -> str | None:
-    """تشخیص می‌دهد آیا hostname یک نمایش جایگزین (غیرمتعارف) از یک آدرس IPv4 است،
-    مثل عدد اعشاری تک‌رقمی (2130706433)، هگزادسیمال (0x7f000001)، اوکتال
-    (0177.0.0.1) یا فرم کوتاه (127.1). این فرم‌ها توسط ipaddress.ip_address
-    استاندارد رد می‌شوند اما بسیاری از resolver ها/کتابخانه‌های شبکه (از جمله
-    inet_aton در سطح سیستم‌عامل) آن‌ها را به‌عنوان IP معتبر می‌پذیرند — پس اگر
-    این بررسی را نکنیم، مهاجم می‌تواند با یکی از این فرم‌ها فیلتر hostname را
-    دور بزند و در عین حال به یک IP داخلی متصل شود.
-    """
-    try:
-        ipaddress.ip_address(hostname)
-        return None  # فرم استاندارد است؛ مسیر عادی resolve آن را می‌گیرد
-    except ValueError:
-        pass
-    try:
-        return socket.inet_ntoa(socket.inet_aton(hostname))
-    except OSError:
-        return None
-
-
-async def resolve_safe_ips(hostname: str) -> list[str]:
-    """Resolve a destination and keep every publicly routable address.
-
-    The previous VLESS path selected the first acceptable DNS answer. On hosts
-    with mixed IPv4/IPv6 (or otherwise flaky) egress, that single choice could
-    be unreachable even though another public address worked. The reference
-    RVG project lets asyncio.open_connection() choose/fallback itself; this
-    version preserves SSRF protection while trying every safe address.
-    """
-    alt = _alt_ip_literal(hostname)
-    if alt is not None:
-        return [] if is_blocked_ip(alt) else [alt]
-
-    try:
-        infos = await asyncio.get_event_loop().getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
-    except socket.gaierror:
-        return []
-
-    result: list[str] = []
-    seen: set[str] = set()
-    for info in infos:
-        ip = info[4][0]
-        if ip in seen or is_blocked_ip(ip):
-            continue
-        seen.add(ip)
-        result.append(ip)
-    return result
-
-
-async def resolve_safe_ip(hostname: str) -> str | None:
-    """اگر hostname به یک IP عمومی/امن resolve شود آن IP را برمی‌گرداند، وگرنه None.
-
-    به‌جای این‌که فقط نتیجه‌ی بولی برگردانیم و بعداً اجازه دهیم httpx دوباره
-    hostname را resolve کند (که باز‌ی برای DNS rebinding باز می‌گذارد)،
-    همان IP بررسی‌شده را برمی‌گردانیم تا request واقعی مستقیماً به همان IP برود.
-    """
-    alt = _alt_ip_literal(hostname)
-    if alt is not None:
-        return None if is_blocked_ip(alt) else alt
-
-    try:
-        infos = await asyncio.get_event_loop().getaddrinfo(hostname, None)
-    except socket.gaierror:
-        return None
-    for info in infos:
-        ip = info[4][0]
-        if not is_blocked_ip(ip):
-            return ip
-    return None
-
-
-async def is_proxy_target_allowed(target_url: str) -> tuple[bool, str, str | None]:
-    parsed = urlparse(target_url)
-    if parsed.scheme not in ("http", "https"):
-        return False, "scheme not allowed", None
-    hostname = parsed.hostname
-    if not hostname:
-        return False, "invalid host", None
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    if CONFIG["proxy_allowed_ports"] and port not in CONFIG["proxy_allowed_ports"]:
-        return False, "destination port not allowed", None
-    host_l = hostname.lower().rstrip(".")
-    if CONFIG["proxy_require_allowlist"] and not CONFIG["proxy_allowlist"]:
-        return False, "proxy allowlist is not configured", None
-    if CONFIG["proxy_allowlist"]:
-        allowed = any(
-            host_l == d or (d.startswith("*.") and host_l.endswith(d[1:]) and host_l != d[2:])
-            for d in CONFIG["proxy_allowlist"]
-        )
-        if not allowed:
-            return False, "domain not in allowlist", None
-    safe_ip = await resolve_safe_ip(hostname)
-    if safe_ip is None:
-        return False, "target resolves to a private/internal address", None
-    return True, "", safe_ip
-
-
-# ───────────────────────── Basic endpoints ─────────────────────────
-
+# ── Basic endpoints ───────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"service": APP_NAME, "version": APP_VERSION, "status": "active", "host": get_host()}
-
+    return {"service": "RVG Gateway", "version": "9.2", "status": "active", "channel": "https://t.me/CodeBoxo"}
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "connections": len(connections), "uptime": uptime_str(), "version": APP_VERSION}
+    return {"status": "ok", "connections": len(connections), "uptime": uptime()}
+
+# ── Subscription (single link) ────────────────────────────────────────────────
+@app.get("/sub/{uuid}")
+async def subscription_single(uuid: str):
+    async with LINKS_LOCK:
+        link = LINKS.get(uuid)
+    if not link or not is_link_allowed(link):
+        raise HTTPException(status_code=404, detail="not found or inactive")
+    host = get_host()
+    proto = link.get("protocol", DEFAULT_PROTOCOL)
+    vless = generate_share_link(uuid, host, remark=f"RVG-{link['label']}", protocol=proto)
+    content = base64.b64encode(vless.encode()).decode()
+    headers = build_sub_headers(link["label"], link.get("used_bytes", 0), link.get("limit_bytes", 0), link.get("expires_at"))
+    return Response(content=content, media_type="text/plain", headers=headers)
+
+@app.get("/sub-all")
+async def subscription_all(_=Depends(require_auth)):
+    host = get_host()
+    async with LINKS_LOCK:
+        allowed = [d for d in LINKS.values() if is_link_allowed(d)]
+        lines = [
+            generate_share_link(uid, host, remark=f"RVG-{d['label']}", protocol=d.get("protocol", DEFAULT_PROTOCOL))
+            for uid, d in LINKS.items()
+            if is_link_allowed(d)
+        ]
+        total_used = sum(d.get("used_bytes", 0) for d in allowed)
+        total_limit = sum(d.get("limit_bytes", 0) for d in allowed)
+        expiries = [d["expires_at"] for d in allowed if d.get("expires_at")]
+    nearest_exp = min(expiries) if expiries else None
+    content = base64.b64encode("\n".join(lines).encode()).decode()
+    headers = build_sub_headers("RVG-All", total_used, total_limit, nearest_exp)
+    return Response(content=content, media_type="text/plain", headers=headers)
 
 
-@app.get("/health/live")
-async def health_live():
-    # Liveness never touches external dependencies; a temporary DB/Redis
-    # outage must not make the process look dead to the orchestrator.
-    return {"status": "alive", "version": APP_VERSION}
-
-
-@app.get("/health/ready")
-async def health_ready():
-    if http_client is None:
-        raise HTTPException(status_code=503, detail="service not ready")
+@app.get("/api/server/location")
+async def server_location(_=Depends(require_auth)):
     try:
-        # اسکن سنگینِ integrity_check فقط یک‌بار موقع startup اجرا می‌شود
-        # (در lifespan)؛ اینجا فقط یک پینگ سبک لازم است تا مطمئن شویم
-        # اتصال به دیتابیس هنوز برقرار و قابل‌کوئری است.
-        await asyncio.to_thread(_db_quick_ping_sync)
+        client = http_client or httpx.AsyncClient(timeout=5)
+        r = await client.get("http://ip-api.com/json/?fields=status,country,city,lat,lon,query")
+        d = r.json()
+        if d.get("status") != "success":
+            raise Exception("lookup failed")
     except Exception:
-        raise HTTPException(status_code=503, detail="database not ready")
-    if CONFIG["redis_url"]:
-        if redis_client is None:
-            raise HTTPException(status_code=503, detail="redis not ready")
-        try:
-            await redis_client.ping()
-        except Exception:
-            raise HTTPException(status_code=503, detail="redis not ready")
-    return {"status": "ready", "version": APP_VERSION}
+        raise HTTPException(502, "دریافت موقعیت سرور ممکن نشد")
+    return {
+        "ip": d.get("query"),
+        "city": d.get("city"),
+        "country": d.get("country"),
+        "lat": d.get("lat"),
+        "lon": d.get("lon"),
+    }
 
+# ══════════════════════════════════════════════════════════════════════════════
+# SUB GROUP endpoints (بدون تغییر)
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ───────────────────────── Auth endpoints ─────────────────────────
+async def _create_sub_core(body: dict) -> dict:
+    name = (body.get("name") or "گروه جدید").strip()[:60]
+    desc = (body.get("desc") or "").strip()[:200]
+    password = (body.get("password") or "").strip()
+    sub_id = generate_uuid()
+    uuid_key = secrets.token_urlsafe(16)
+    async with SUBS_LOCK:
+        SUBS[sub_id] = {
+            "name": name,
+            "desc": desc,
+            "password_hash": hash_password(password) if password else None,
+            "uuid_key": uuid_key,
+            "created_at": datetime.now().isoformat(),
+            "link_ids": [],
+            "node_link_ids": [],
+        }
+    asyncio.create_task(save_state())
+    log_activity("sub", f"گروه «{name}» ساخته شد", "ok")
+    host = get_host()
+    return {
+        "sub_id": sub_id,
+        **SUBS[sub_id],
+        "public_url": f"https://{host}/p/{uuid_key}",
+        "sub_url": f"https://{host}/sub-group/{uuid_key}",
+    }
 
-class LoginRequest(BaseModel):
-    password: str = Field(default="", max_length=1024)
+@app.post("/api/subs")
+async def create_sub(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    return await _create_sub_core(body)
 
+@app.post("/api/node/subs")
+async def node_create_sub(request: Request, key_id: str = Depends(require_node_key)):
+    await _require_node_manage(key_id)
+    body = await request.json()
+    return await _create_sub_core(body)
 
-class ChangePasswordRequest(BaseModel):
-    current_password: str = Field(default="", max_length=1024)
-    new_password: str = Field(default="", min_length=4, max_length=1024)
+@app.get("/api/subs")
+async def list_subs(_=Depends(require_auth)):
+    host = get_host()
+    async with SUBS_LOCK:
+        snap_subs = dict(SUBS)
+    async with LINKS_LOCK:
+        snap_links = dict(LINKS)
+    result = []
+    for sid, s in snap_subs.items():
+        link_ids = s.get("link_ids", [])
+        node_link_ids = s.get("node_link_ids", [])
+        foreign_links = s.get("foreign_links", [])
+        active_count = sum(1 for lid in link_ids if is_link_allowed(snap_links.get(lid)))
+        total_used = sum(snap_links[lid].get("used_bytes", 0) for lid in link_ids if lid in snap_links)
+        total_used += sum(int(fl.get("used_bytes") or 0) for fl in foreign_links)
+        result.append({
+            "sub_id": sid,
+            **s,
+            "node_link_ids": node_link_ids,
+            "foreign_links": foreign_links,
+            "password_hash": None,
+            "has_password": s.get("password_hash") is not None,
+            "links_count": len(link_ids) + len(node_link_ids) + len(foreign_links),
+            "active_count": active_count + len(foreign_links),
+            "total_used_bytes": total_used,
+            "total_used_fmt": fmt_bytes(total_used),
+            "public_url": f"https://{host}/p/{s['uuid_key']}",
+            "sub_url": f"https://{host}/sub-group/{s['uuid_key']}",
+        })
+    result.sort(key=lambda x: x["created_at"], reverse=True)
+    return {"subs": result}
 
+@app.patch("/api/subs/{sub_id}")
+async def update_sub(sub_id: str, request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    async with SUBS_LOCK:
+        if sub_id not in SUBS:
+            raise HTTPException(status_code=404, detail="sub not found")
+        s = SUBS[sub_id]
+        if "name" in body:
+            s["name"] = str(body["name"])[:60]
+        if "desc" in body:
+            s["desc"] = str(body["desc"])[:200]
+        if "password" in body:
+            pw = str(body["password"]).strip()
+            s["password_hash"] = hash_password(pw) if pw else None
+        if "link_ids" in body:
+            s["link_ids"] = list(body["link_ids"])
+        if "node_link_ids" in body:
+            s["node_link_ids"] = [str(x) for x in body["node_link_ids"] if "::" in str(x)]
+        if "foreign_links" in body:
+            fl = body["foreign_links"] if isinstance(body["foreign_links"], list) else []
+            clean = []
+            for it in fl:
+                if not isinstance(it, dict) or not it.get("vless_link"):
+                    continue
+                clean.append({
+                    "key": str(it.get("key") or "")[:120],
+                    "label": str(it.get("label") or "کانفیگ")[:60],
+                    "vless_link": str(it.get("vless_link"))[:2000],
+                    "used_bytes": int(it.get("used_bytes") or 0),
+                    "source": str(it.get("source") or "")[:60],
+                })
+            s["foreign_links"] = clean
+    asyncio.create_task(save_state())
+    return {"ok": True}
 
-class SetupPasswordRequest(BaseModel):
-    password: str = Field(default="", min_length=4, max_length=1024)
-    password_confirm: str = Field(default="", min_length=4, max_length=1024)
+@app.delete("/api/subs/{sub_id}")
+async def delete_sub(sub_id: str, _=Depends(require_auth)):
+    async with SUBS_LOCK:
+        if sub_id not in SUBS:
+            raise HTTPException(status_code=404, detail="sub not found")
+        name = SUBS[sub_id].get("name", sub_id)
+        del SUBS[sub_id]
+    async with LINKS_LOCK:
+        for link in LINKS.values():
+            if link.get("sub_id") == sub_id:
+                link["sub_id"] = None
+    asyncio.create_task(save_state())
+    log_activity("sub", f"گروه «{name}» حذف شد", "warn")
+    return {"ok": True, "deleted": sub_id}
 
+@app.post("/api/subs/{sub_id}/links")
+async def assign_link_to_sub(sub_id: str, request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    link_id = str(body.get("link_id", ""))
+    action = str(body.get("action", "add"))
+    async with SUBS_LOCK:
+        if sub_id not in SUBS:
+            raise HTTPException(status_code=404, detail="sub not found")
+        s = SUBS[sub_id]
+        ids = s.setdefault("link_ids", [])
+        if action == "add":
+            if link_id not in ids:
+                ids.append(link_id)
+        else:
+            if link_id in ids:
+                ids.remove(link_id)
+    async with LINKS_LOCK:
+        if link_id in LINKS:
+            LINKS[link_id]["sub_id"] = sub_id if action == "add" else None
+    asyncio.create_task(save_state())
+    return {"ok": True}
 
-def _password_strength_error(password: str) -> str | None:
-    if len(password) < 4:
-        return "رمز عبور باید حداقل ۴ کاراکتر باشد"
-    if len(password.encode("utf-8")) > 4096:
-        return "رمز عبور بیش از حد طولانی است"
-    return None
+# ── مدیریت گروه از راه دور (توسط پنل مرکزی روی این نود) ──────────────────────
+@app.patch("/api/node/subs/{sub_id}")
+async def node_update_sub(sub_id: str, request: Request, key_id: str = Depends(require_node_key)):
+    peer = await _require_node_manage(key_id)
+    result = await update_sub(sub_id, request, None)
+    log_activity("node", f"گروه {sub_id[:8]} از راه دور توسط «{peer}» ویرایش شد", "warn")
+    return result
 
+@app.delete("/api/node/subs/{sub_id}")
+async def node_delete_sub(sub_id: str, key_id: str = Depends(require_node_key)):
+    peer = await _require_node_manage(key_id)
+    result = await delete_sub(sub_id, None)
+    log_activity("node", f"گروه {sub_id[:8]} از راه دور توسط «{peer}» حذف شد", "err")
+    return result
 
-@app.get("/api/setup-status")
-async def api_setup_status():
-    return {"setup_required": bool(AUTH["setup_required"])}
+@app.post("/api/node/subs/{sub_id}/links")
+async def node_assign_link_to_sub(sub_id: str, request: Request, key_id: str = Depends(require_node_key)):
+    await _require_node_manage(key_id)
+    return await assign_link_to_sub(sub_id, request, None)
 
+# ── Public sub-group subscription file ───────────────────────────────────────
+@app.get("/sub-group/{uuid_key}")
+async def sub_group_subscription(uuid_key: str, request: Request):
+    async with SUBS_LOCK:
+        sub = next((s for s in SUBS.values() if s.get("uuid_key") == uuid_key), None)
+    if not sub:
+        raise HTTPException(status_code=404, detail="not found")
+    if sub.get("password_hash"):
+        pw = request.query_params.get("pw", "")
+        if hash_password(pw) != sub["password_hash"]:
+            raise HTTPException(status_code=403, detail="wrong password")
+    host = get_host()
+    link_ids = sub.get("link_ids", [])
+    node_link_ids = sub.get("node_link_ids", [])
+    async with LINKS_LOCK:
+        lines = []
+        allowed_links = []
+        for lid in link_ids:
+            link = LINKS.get(lid)
+            if link and is_link_allowed(link):
+                lines.append(generate_share_link(lid, host, remark=f"RVG-{link['label']}", protocol=link.get("protocol", DEFAULT_PROTOCOL)))
+                allowed_links.append(link)
+        total_used = sum(l.get("used_bytes", 0) for l in allowed_links)
+        total_limit = sum(l.get("limit_bytes", 0) for l in allowed_links)
+        expiries = [l["expires_at"] for l in allowed_links if l.get("expires_at")]
+    if node_link_ids:
+        async with NODES_LOCK:
+            nodes_snap = {nid: dict(n) for nid, n in NODES.items()}
+        needed_nodes = list({ref.split("::", 1)[0] for ref in node_link_ids if "::" in ref})
+        needed_nodes = [nid for nid in needed_nodes if nid in nodes_snap]
+        snapshots = await asyncio.gather(
+            *(_fetch_node_snapshot(nid, nodes_snap[nid], fresh=True) for nid in needed_nodes),
+            return_exceptions=True,
+        )
+        snap_by_node = dict(zip(needed_nodes, snapshots))
+        for ref in node_link_ids:
+            if "::" not in ref:
+                continue
+            nid, uid = ref.split("::", 1)
+            snap = snap_by_node.get(nid)
+            if not snap or isinstance(snap, Exception):
+                continue
+            node_link = next((l for l in (snap.get("links") or []) if l.get("uuid") == uid), None)
+            if not node_link or not node_link.get("vless_link"):
+                continue
+            if not node_link.get("active", True):
+                continue
+            if node_link.get("expired"):
+                continue
+            lb = node_link.get("limit_bytes", 0)
+            if lb > 0 and node_link.get("used_bytes", 0) >= lb:
+                continue
+            lines.append(node_link["vless_link"])
+            total_used += node_link.get("used_bytes", 0)
+            total_limit += node_link.get("limit_bytes", 0)
+            if node_link.get("expires_at"):
+                expiries.append(node_link["expires_at"])
+    for fl in sub.get("foreign_links", []):
+        vl = fl.get("vless_link")
+        if not vl:
+            continue
+        lines.append(vl)
+        total_used += int(fl.get("used_bytes") or 0)
+    nearest_exp = min(expiries) if expiries else None
+    content = base64.b64encode("\n".join(lines).encode()).decode()
+    headers = build_sub_headers(f"پنل: {sub['name']}", total_used, total_limit, nearest_exp)
+    return Response(content=content, media_type="text/plain", headers=headers)
 
-@app.post("/api/setup-password")
-async def api_setup_password(payload: SetupPasswordRequest, request: Request):
-    if not AUTH["setup_required"] or AUTH["password_hash"]:
-        raise HTTPException(status_code=409, detail="راه‌اندازی قبلاً انجام شده است")
-    ip = client_ip(request)
-    allowed, wait = await check_login_allowed(ip)
-    if not allowed:
-        raise HTTPException(status_code=429, detail=f"تعداد تلاش‌ها زیاد بود. {wait} ثانیه دیگر دوباره تلاش کنید")
-    if payload.password != payload.password_confirm:
-        await record_login_failure(ip)
-        raise HTTPException(status_code=400, detail="تکرار رمز عبور یکسان نیست")
-    err = _password_strength_error(payload.password)
-    if err:
-        await record_login_failure(ip)
-        raise HTTPException(status_code=400, detail=err)
-    new_hash = hash_password(payload.password)
-    # Persist first, then change in-memory state. This prevents a partial
-    # setup if the database write fails.
-    await _db_set_setting("password_hash", new_hash)
-    AUTH["password_hash"] = new_hash
-    AUTH["setup_required"] = False
-    await record_login_success(ip)
-    logger.info("🔐 AUDIT initial admin password configured ip=%s", ip)
-    asyncio.create_task(audit("initial_password_configured", ip))
-    token = await create_session()
-    resp = JSONResponse({"ok": True, "setup_required": False})
-    resp.set_cookie(key=SESSION_COOKIE, value=token, max_age=SESSION_TTL, httponly=True, samesite="lax", secure=cookie_secure(), path="/")
-    resp.set_cookie(key=CSRF_COOKIE, value=csrf_token_for_session(token), max_age=SESSION_TTL, httponly=False, samesite="lax", secure=cookie_secure(), path="/")
-    return resp
-
-
+# ── Auth endpoints ────────────────────────────────────────────────────────────
 @app.post("/api/login")
-async def api_login(payload: LoginRequest, request: Request):
-    if AUTH["setup_required"] or not AUTH["password_hash"]:
-        raise HTTPException(status_code=428, detail="ابتدا رمز عبور پنل را تعیین کنید")
+async def api_login(request: Request):
+    body = await request.json()
     ip = client_ip(request)
-    allowed, wait = await check_login_allowed(ip)
-    if not allowed:
-        raise HTTPException(status_code=429, detail=f"تعداد تلاش‌های ناموفق زیاد بود. {wait} ثانیه دیگر دوباره تلاش کنید")
-
-    password = payload.password
-    if not verify_password(password, AUTH["password_hash"]):
-        await record_login_failure(ip)
-        logger.warning("🔒 AUDIT login failed ip=%s", ip)
-        asyncio.create_task(audit("login_failed", ip, "invalid password"))
+    if hash_password(str(body.get("password", ""))) != AUTH["password_hash"]:
+        log_activity("auth", f"تلاش ورود ناموفق از {ip}", "err")
         raise HTTPException(status_code=401, detail="رمز عبور اشتباه است")
-
-    # Transparently upgrade legacy PBKDF2 hashes after a successful login.
-    if password_needs_rehash(AUTH["password_hash"]):
-        AUTH["password_hash"] = hash_password(password)
-        await _db_set_setting("password_hash", AUTH["password_hash"])
-    await record_login_success(ip)
     token = await create_session()
-    logger.info("🔑 AUDIT login success ip=%s", ip)
-    asyncio.create_task(audit("login_success", ip))
+    log_activity("auth", f"ورود موفق به پنل از {ip}", "ok")
     resp = JSONResponse({"ok": True})
-    resp.set_cookie(
-        key=SESSION_COOKIE, value=token, max_age=SESSION_TTL,
-        httponly=True, samesite="lax", secure=cookie_secure(), path="/",
-    )
-    # کوکی CSRF عمداً httponly نیست: جاوااسکریپت پنل باید بتواند مقدارش را
-    # بخواند و به‌عنوان هدر X-CSRF-Token در درخواست‌های تغییردهنده بفرستد.
-    resp.set_cookie(
-        key=CSRF_COOKIE, value=csrf_token_for_session(token), max_age=SESSION_TTL,
-        httponly=False, samesite="lax", secure=cookie_secure(), path="/",
-    )
+    resp.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL, httponly=True, samesite="lax", path="/")
     return resp
-
 
 @app.post("/api/logout")
-async def api_logout(request: Request, _=Depends(require_auth_csrf)):
-    token = request.cookies.get(SESSION_COOKIE)
-    await destroy_session(token)
+async def api_logout(request: Request):
+    await destroy_session(request.cookies.get(SESSION_COOKIE))
     resp = JSONResponse({"ok": True})
     resp.delete_cookie(SESSION_COOKIE, path="/")
-    resp.delete_cookie(CSRF_COOKIE, path="/")
     return resp
-
 
 @app.get("/api/me")
 async def api_me(request: Request):
-    token = request.cookies.get(SESSION_COOKIE)
-    return {"authenticated": await is_valid_session(token)}
-
-
-def _storage_status_sync() -> dict:
-    db_path = os.path.abspath(DB_PATH)
-    db_dir = os.path.dirname(db_path) or os.getcwd()
-    data_root = os.path.abspath("/data")
-    persistent = db_path == data_root or db_path.startswith(data_root + os.sep)
-    mounted = os.path.ismount(data_root) if os.path.isdir(data_root) else False
-    railway = bool(os.environ.get("RAILWAY_ENVIRONMENT_NAME") or os.environ.get("RAILWAY_PROJECT_ID"))
-    writable = os.access(db_dir, os.W_OK)
-    return {
-        "db_path": db_path,
-        "persistent_path": persistent,
-        "volume_mounted": mounted,
-        "writable": writable,
-        "railway": railway,
-        "railway_volume_required": bool(railway and CONFIG["require_persistent_volume"] and persistent),
-        "railway_volume_recommended": bool(railway and not mounted),
-    }
-
-
-def _system_status_sync() -> dict:
-    db_path = os.path.abspath(DB_PATH)
-    db_dir = os.path.dirname(db_path) or os.getcwd()
-    try:
-        usage = os.statvfs(db_dir)
-        disk_total = usage.f_blocks * usage.f_frsize
-        disk_free = usage.f_bavail * usage.f_frsize
-    except OSError:
-        disk_total = disk_free = 0
-
-    db_ok = False
-    db_error = None
-    try:
-        conn = _db_connect()
-        row = conn.execute("PRAGMA integrity_check").fetchone()
-        db_ok = bool(row and row[0] == "ok")
-        conn.close()
-    except Exception as exc:
-        db_error = str(exc)[:200]
-
-    persistent = db_path == "/data" or db_path.startswith("/data" + os.sep)
-    worker_settings = _worker_settings_snapshot_sync()
-    last_code_raw = worker_settings.get("cloudflare_worker_last_status_code", "") or ""
-    try:
-        last_code = int(last_code_raw) if last_code_raw else None
-    except ValueError:
-        last_code = None
-    worker_status = {
-        "configured": bool(ACTIVE_WORKER_URL.strip()),
-        "status": worker_settings.get("cloudflare_worker_status", "not_configured"),
-        "deployed_at": worker_settings.get("cloudflare_worker_deployed_at", "") or "",
-        "last_checked_at": worker_settings.get("cloudflare_worker_last_checked_at", "") or "",
-        "last_status_code": last_code,
-        "worker_name": worker_settings.get("cloudflare_worker_name", "") or "",
-        "url": ACTIVE_WORKER_URL.strip(),
-        "domain_mode": worker_settings.get("cloudflare_worker_domain_mode", "workers_dev") or "workers_dev",
-        "hostname": worker_settings.get("cloudflare_worker_hostname", "") or "",
-        "domain_id": worker_settings.get("cloudflare_worker_domain_id", "") or "",
-        "error": worker_settings.get("cloudflare_worker_last_error", "") or "",
-    }
-    return {
-        "version": APP_VERSION,
-        "python": f"{__import__('sys').version_info.major}.{__import__('sys').version_info.minor}.{__import__('sys').version_info.micro}",
-        "platform": os.environ.get("RAILWAY_ENVIRONMENT_NAME", "standalone"),
-        "railway": bool(os.environ.get("RAILWAY_ENVIRONMENT_NAME") or os.environ.get("RAILWAY_PROJECT_ID")),
-        "database": {
-            "ok": db_ok, "path": db_path, "persistent": persistent,
-            "writable": os.access(db_dir, os.W_OK), "error": db_error,
-        },
-        "redis": {"configured": bool(CONFIG["redis_url"]), "connected": bool(redis_client is not None)},
-        "cloudflare": worker_status,
-        "backup": {"encryption_configured": bool(CONFIG["backup_encryption_key"]), "plaintext_allowed": CONFIG["allow_plaintext_backup"]},
-        "telegram": {"configured": bool(CONFIG["telegram_bot_token"] and CONFIG["telegram_chat_id"])},
-        "disk": {"total_bytes": disk_total, "free_bytes": disk_free, "free_percent": round((disk_free / disk_total) * 100, 1) if disk_total else None},
-        "connections": len(connections),
-        "links": len(LINKS),
-        "uptime": uptime_str(),
-    }
-
-
-@app.get("/api/system/status")
-async def api_system_status(_=Depends(require_auth)):
-    return await asyncio.to_thread(_system_status_sync)
-
-
-@app.post("/api/system/storage-test")
-async def api_storage_test(request: Request, _=Depends(require_auth_csrf)):
-    storage_test = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)) or os.getcwd(), ".vortex-write-test")
-    def _write_test():
-        with open(storage_test, "w", encoding="utf-8") as fh:
-            fh.write(datetime.now().isoformat())
-    try:
-        await asyncio.to_thread(_write_test)
-        await asyncio.to_thread(os.remove, storage_test)
-    except OSError as exc:
-        raise HTTPException(status_code=503, detail=f"ذخیره‌سازی قابل نوشتن نیست: {exc}")
-    await audit("storage_test", client_ip(request), "storage write test passed")
-    return {"ok": True}
-
-
-@app.get("/api/setup/status")
-async def api_setup_wizard_status(request: Request, _=Depends(require_auth)):
-    async with DB_LOCK:
-        settings_rows = await asyncio.to_thread(_db_get_settings_sync)
-    settings_map = dict(settings_rows)
-    storage = await asyncio.to_thread(_storage_status_sync)
-    return {
-        "setup_completed": settings_map.get("setup_completed") == "1",
-        "storage": storage,
-        "railway": bool(os.environ.get("RAILWAY_ENVIRONMENT_NAME") or os.environ.get("RAILWAY_PROJECT_ID")),
-        "version": APP_VERSION,
-    }
-
-
-@app.post("/api/setup/complete")
-async def api_setup_complete(request: Request, _=Depends(require_auth_csrf)):
-    await _db_set_setting("setup_completed", "1")
-    await audit("setup_completed", client_ip(request), "first-run setup completed")
-    return {"ok": True}
-
+    return {"authenticated": await is_valid_session(request.cookies.get(SESSION_COOKIE))}
 
 @app.post("/api/change-password")
-async def api_change_password(payload: ChangePasswordRequest, request: Request, _=Depends(require_auth_csrf)):
-    current = payload.current_password
-    new = payload.new_password
-    if not verify_password(current, AUTH["password_hash"]):
+async def api_change_password(request: Request, token=Depends(require_auth)):
+    body = await request.json()
+    if hash_password(str(body.get("current_password", ""))) != AUTH["password_hash"]:
         raise HTTPException(status_code=400, detail="رمز فعلی اشتباه است")
-    strength_error = _password_strength_error(new)
-    if strength_error:
-        raise HTTPException(status_code=400, detail=strength_error)
+    new = str(body.get("new_password", ""))
+    if len(new) < 4:
+        raise HTTPException(status_code=400, detail="رمز جدید باید حداقل ۴ کاراکتر باشد")
     AUTH["password_hash"] = hash_password(new)
-    await _db_set_setting("password_hash", AUTH["password_hash"])
-    current_token = request.cookies.get(SESSION_COOKIE)
-    if redis_client is not None:
-        keys = []
-        async for key in redis_client.scan_iter(match="vortex:session:*", count=100):
-            keys.append(key)
-        if keys:
-            await redis_client.delete(*keys)
-        if current_token:
-            await redis_client.setex(f"vortex:session:{current_token}", SESSION_TTL, "1")
-    else:
+    async with SESSIONS_LOCK:
+        SESSIONS.clear()
+        SESSIONS[token] = time.time() + SESSION_TTL
+    await save_state()
+    log_activity("auth", "رمز عبور پنل تغییر کرد", "ok")
+    return {"ok": True}
+# ── Backup / Restore ──────────────────────────────────────────────────────────
+@app.get("/api/backup/export")
+async def backup_export(_=Depends(require_auth)):
+    async with LINKS_LOCK:
+        links_snap = dict(LINKS)
+    async with SUBS_LOCK:
+        subs_snap = dict(SUBS)
+    async with NODE_KEYS_LOCK:
+        node_keys_snap = dict(NODE_KEYS)
+    async with NODES_LOCK:
+        nodes_snap = dict(NODES)
+    data = {
+        "kind": "rvg-backup",
+        "version": "9.2",
+        "exported_at": datetime.now().isoformat(),
+        "host": get_host(),
+        "links": links_snap,
+        "subs": subs_snap,
+        "node_keys": node_keys_snap,
+        "nodes": nodes_snap,
+        "password_hash": AUTH["password_hash"],
+    }
+    content = json.dumps(data, ensure_ascii=False, indent=2)
+    filename = f"rvg-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+    log_activity("system", "فایل بکاپ دانلود شد", "info")
+    return Response(
+        content=content,
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/api/backup/import")
+async def backup_import(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    data = body.get("data")
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="فایل بکاپ نامعتبر است")
+
+    new_links = data.get("links")
+    new_subs = data.get("subs")
+    new_pw_hash = data.get("password_hash")
+    keep_password = bool(body.get("keep_current_password", True))
+
+    if not isinstance(new_links, dict) or not isinstance(new_subs, dict):
+        raise HTTPException(status_code=400, detail="ساختار فایل بکاپ نامعتبر است")
+
+    # همه‌ی instance‌های MTProto رو قبل از جایگزینی داده‌ها متوقف کن
+    try:
+        await mtproto.stop_all()
+    except Exception as exc:
+        logger.warning(f"توقف MTProto قبل از ایمپورت ناموفق بود: {exc}")
+
+    async with LINKS_LOCK:
+        LINKS.clear()
+        LINKS.update(new_links)
+    async with SUBS_LOCK:
+        SUBS.clear()
+        SUBS.update(new_subs)
+
+    # نودها و کلیدهای نود اختیاری‌اند (بکاپ‌های قدیمی این کلیدها را ندارند)
+    new_node_keys = data.get("node_keys")
+    if isinstance(new_node_keys, dict):
+        async with NODE_KEYS_LOCK:
+            NODE_KEYS.clear()
+            NODE_KEYS.update(new_node_keys)
+    new_nodes = data.get("nodes")
+    if isinstance(new_nodes, dict):
+        async with NODES_LOCK:
+            NODES.clear()
+            for nid, n in new_nodes.items():
+                if isinstance(n, dict):
+                    NODES[nid] = _normalize_node(n)
+        _NODE_CACHE.clear()
+
+    if not keep_password and new_pw_hash:
+        AUTH["password_hash"] = new_pw_hash
         async with SESSIONS_LOCK:
             SESSIONS.clear()
-            if current_token:
-                SESSIONS[current_token] = time.time() + SESSION_TTL
-    logger.info("🔑 AUDIT password changed ip=%s", client_ip(request))
-    return {"ok": True}
+            # سشن فعلی رو نگه می‌داریم که کاربر لاگ‌اوت نشه
+            token = request.cookies.get(SESSION_COOKIE)
+            if token:
+                SESSIONS[token] = time.time() + SESSION_TTL
 
+    await save_state()
 
-# ───────────────────────── Cloudflare Worker relay ─────────────────────────
-# یک Worker رایگان روی کلادفلر می‌سازیم که فقط ترافیک را (بعد از چک یک مسیرِ
-# مخفیِ تصادفی) به همین گیت‌وی روی Railway پاس می‌دهد؛ منطق VLESS/احراز هویت
-# همچنان همین‌جا روی سرور اجرا می‌شود — Worker صرفاً یک رله‌ی شفاف است.
-
-class CloudflareWorkerRequest(BaseModel):
-    api_token: str = Field(default="", min_length=1, max_length=2048)
-    domain_mode: Literal["workers_dev", "custom"] = "workers_dev"
-    hostname: str = Field(default="", max_length=253)
-
-
-class CloudflareTokenRequest(BaseModel):
-    api_token: str = Field(default="", min_length=1, max_length=2048)
-
-
-class CloudflareDomainRequest(BaseModel):
-    api_token: str = Field(default="", min_length=1, max_length=2048)
-    hostname: str = Field(min_length=1, max_length=253)
-
-
-_CF_API_BASE = "https://api.cloudflare.com/client/v4"
-_LOCAL_HOSTNAMES = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
-
-
-def _cf_first_error(data: dict, fallback: str = "خطای نامشخص از Cloudflare") -> tuple[int | None, str]:
-    errors = data.get("errors") or [] if isinstance(data, dict) else []
-    if errors and isinstance(errors[0], dict):
-        return errors[0].get("code"), str(errors[0].get("message") or fallback)
-    return None, fallback
-
-
-def _cf_user_error(status_code: int, data: dict, fallback: str) -> str:
-    code, msg = _cf_first_error(data, fallback)
-    text = msg.lower()
-    if status_code in (401, 403) or "permission" in text or "forbidden" in text or code in {9109, 10000}:
-        return ("Cloudflare دسترسی این عملیات را رد کرد. توکن باید دسترسی Workers Scripts Write داشته باشد؛ "
-                "برای دامنه سفارشی نیز مجوز لازم برای اتصال Domain را بدهد. " + f"جزئیات Cloudflare: {msg}")
-    if status_code == 404:
-        return f"منبع موردنظر در Cloudflare پیدا نشد. نام Worker یا Account را بررسی کن. جزئیات: {msg}"
-    return f"Cloudflare: {msg}"
-
-
-def _normalize_cf_hostname(value: str) -> str:
-    host = (value or "").strip().lower().rstrip(".")
-    if not host or len(host) > 253 or host in _LOCAL_HOSTNAMES or host.endswith(".workers.dev"):
-        return ""
-    pattern = r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}"
-    return host if re.fullmatch(pattern, host) else ""
-
-
-async def _cloudflare_json_request(client: httpx.AsyncClient, method: str, url: str, *, headers: dict, **kwargs):
     try:
-        response = await client.request(method, url, headers=headers, **kwargs)
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="پاسخ Cloudflare دیر رسید؛ دوباره تلاش کن")
-    except httpx.HTTPError:
-        raise HTTPException(status_code=502, detail="ارتباط با Cloudflare برقرار نشد؛ اینترنت/دسترسی سرور را بررسی کن")
-    try:
-        data = response.json()
-    except ValueError:
-        data = {}
-    return response, data
+        await _restart_mtproto_instances()
+    except Exception as exc:
+        logger.error(f"راه‌اندازی مجدد MTProto بعد از ایمپورت ناموفق بود: {exc}")
 
+    log_activity("system", "بکاپ با موفقیت روی پنل بازیابی شد", "ok")
+    return {"ok": True, "links_count": len(LINKS), "subs_count": len(SUBS), "nodes_count": len(NODES)}
+    
 
-def _worker_settings_snapshot_sync() -> dict:
-    return dict(_db_get_settings_sync())
-
-
-def _save_worker_status_sync(values: dict[str, str]) -> None:
-    conn = _db_connect()
-    try:
-        conn.executemany("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", list(values.items()))
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def _build_cloudflare_worker_script(origin_host: str, gate: str) -> str:
-    origin = json.dumps(f"https://{origin_host}")
-    gate_prefix = json.dumps(f"/{gate}")
-    return f"""const ORIGIN = {origin};
-const GATE = {gate_prefix};
-
-export default {{
-  async fetch(request) {{
-    const incoming = new URL(request.url);
-    if (!incoming.pathname.startsWith(GATE + "/")) {{
-      return new Response("Not Found", {{ status: 404, headers: {{ "cache-control": "no-store" }} }});
-    }}
-
-    const upstreamPath = incoming.pathname.slice(GATE.length) || "/";
-    const allowed = upstreamPath.startsWith("/tunnel/")
-      || upstreamPath.startsWith("/sub/")
-      || upstreamPath === "/health/ready";
-    if (!allowed) {{
-      return new Response("Not Found", {{ status: 404, headers: {{ "cache-control": "no-store" }} }});
-    }}
-
-    const target = new URL(ORIGIN);
-    target.pathname = upstreamPath;
-    target.search = incoming.search;
-
-    // Use the platform-supported fetch(url, request) proxy form. Cloudflare
-    // rewrites the destination hostname for the subrequest and preserves the
-    // incoming WebSocket Upgrade without trying to mutate forbidden headers
-    // such as Host/Connection.
-    return fetch(target.toString(), request);
-  }}
-}};
-"""
-
-
-def _resolve_public_host(request: Request) -> str:
-    """Best-effort public hostname for this gateway.
-
-    Prefers the explicit RAILWAY_PUBLIC_DOMAIN env var when it is actually
-    set. If Railway hasn't had that variable added to the service (a common
-    setup gap — generating a domain in Settings → Networking does not by
-    itself inject it into the container), fall back to the Host header of
-    the very request the admin is making right now. Since the admin is
-    already logged into the panel through its real public URL, that Host
-    header reflects the correct public domain without requiring any manual
-    Railway configuration.
-    """
-    env_host = get_host().strip()
-    if env_host and env_host.lower() not in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}:
-        return env_host
-
-    # Only trust the Host header as a fallback for this admin-only, already
-    # authenticated action; it is never used to bypass auth or CSRF.
-    header_host = (request.headers.get("host") or "").strip()
-    if not header_host:
-        return env_host or "localhost"
-    parsed = urlparse(header_host if "://" in header_host else f"https://{header_host}")
-    candidate = (parsed.hostname or "").strip().rstrip(".")
-    if not candidate or candidate.lower() in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}:
-        return env_host or "localhost"
-    # Never point the Worker relay back at a workers.dev address (would create
-    # a Worker → Worker loop instead of Worker → Railway origin).
-    if candidate.lower().endswith(".workers.dev"):
-        return env_host or "localhost"
-    return candidate
-
-
-@app.post("/api/cloudflare/deploy-worker")
-async def api_cloudflare_deploy_worker(payload: CloudflareWorkerRequest, request: Request, _=Depends(require_auth_csrf)):
-    api_token = payload.api_token.strip()
-    if not api_token:
-        raise HTTPException(status_code=400, detail="API Token را وارد کن")
-    normalized_hostname = ""
-    if payload.domain_mode == "custom":
-        normalized_hostname = _normalize_cf_hostname(payload.hostname)
-        if not normalized_hostname:
-            raise HTTPException(status_code=422, detail="دامنه سفارشی معتبر نیست؛ مثل relay.example.com وارد کن")
-
-    # If RAILWAY_PUBLIC_DOMAIN is missing we no longer fail immediately —
-    # _resolve_public_host() below falls back to the current request's Host
-    # header, which works automatically for the vast majority of setups.
-    early_host = _resolve_public_host(request)
-    if early_host.lower() in {"", "localhost", "127.0.0.1", "0.0.0.0", "::1"}:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "آدرس عمومی گیت‌وی قابل تشخیص نیست (نه از RAILWAY_PUBLIC_DOMAIN و نه از هدر درخواست). "
-                "مطمئن شو تو Railway، Settings → Networking یک Public Domain ساخته‌ای و از همان آدرس "
-                "(نه localhost) وارد پنل شده‌ای، بعد دوباره امتحان کن."
-            ),
-        )
-
-    headers = {"Authorization": f"Bearer {api_token}"}
-
-    async with httpx.AsyncClient(timeout=20) as client:
-        try:
-            verify_resp = await client.get("https://api.cloudflare.com/client/v4/user/tokens/verify", headers=headers)
-        except httpx.HTTPError:
-            raise HTTPException(status_code=502, detail="اتصال به Cloudflare برقرار نشد")
-        try:
-            verify_data = verify_resp.json()
-        except ValueError:
-            verify_data = {}
-        if verify_resp.status_code != 200 or not verify_data.get("success"):
-            raise HTTPException(status_code=400, detail="توکن Cloudflare معتبر نیست یا منقضی شده")
-
-        try:
-            accounts_resp = await client.get(
-                "https://api.cloudflare.com/client/v4/accounts",
-                headers=headers,
-                params={"page": 1, "per_page": 100},
-            )
-        except httpx.HTTPError:
-            raise HTTPException(status_code=502, detail="اتصال به Cloudflare برقرار نشد")
-        try:
-            accounts_data = accounts_resp.json()
-        except ValueError:
-            accounts_data = {}
-        if accounts_resp.status_code != 200 or not accounts_data.get("success"):
-            raise HTTPException(
-                status_code=400,
-                detail="خواندن Account از کلادفلر ناموفق بود؛ توکن باید دسترسی Account لازم و Workers Scripts Edit داشته باشد",
-            )
-        accounts_list = accounts_data.get("result") or []
-        account_id = next((item.get("id", "") for item in accounts_list if item.get("id")), "")
-        if not account_id:
-            raise HTTPException(status_code=400, detail="Account ID قابل تشخیص نبود")
-
-        origin_host = _resolve_public_host(request).strip().rstrip("/")
-        parsed_origin = urlparse(origin_host if "://" in origin_host else f"https://{origin_host}")
-        if (parsed_origin.hostname or "").lower() in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}:
-            raise HTTPException(
-                status_code=400,
-                detail="گیت‌وی روی آدرس محلی اجرا می‌شود؛ ابتدا آن را روی یک Origin عمومی مثل Railway دیپلوی کن.",
-            )
-        if not parsed_origin.hostname:
-            raise HTTPException(status_code=400, detail="آدرس عمومی گیت‌وی معتبر نیست")
-        origin_host = parsed_origin.hostname
-
-        # NOTE: existing_settings must be loaded before it is read below.
-        # (Previously this was fetched *after* worker_name/gate already tried
-        # to read from it, which raised UnboundLocalError on every single
-        # call and made Deploy/Update Worker fail 100% of the time.)
-        async with DB_LOCK:
-            existing_settings = await asyncio.to_thread(_db_get_settings_sync)
-
-        worker_name = (existing_settings.get("cloudflare_worker_name") or "").strip()
-        if not worker_name:
-            worker_name = f"vortex-{secrets.token_hex(4)}"
-        # Reuse the previously deployed gate path (if any) instead of always
-        # generating a brand new one. This is the direct fix for "old
-        # sub/tunnel links stop working every time I rebuild the Worker":
-        # since the gate segment is embedded in every generated vless:// and
-        # /sub/ link, changing it on every redeploy silently invalidates all
-        # links already handed out to users. Reusing the same gate means a
-        # Worker rebuild (e.g. after a Railway redeploy changed the origin
-        # host) keeps existing links working; the gate only changes on the
-        # very first deployment.
-        gate = (existing_settings.get("cloudflare_worker_gate") or "").strip()
-        if not gate or not gate.isalnum() or not (10 <= len(gate) <= 20):
-            gate = secrets.token_urlsafe(18).replace("_", "").replace("-", "")[:20]
-        script = _build_cloudflare_worker_script(origin_host, gate)
-        upload_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/workers/scripts/{worker_name}"
-        metadata = {"main_module": "worker.js", "compatibility_date": "2024-09-23"}
-        files = {
-            "metadata": (None, json.dumps(metadata), "application/json"),
-            "worker.js": ("worker.js", script, "application/javascript+module"),
-        }
-        try:
-            upload_resp = await client.put(upload_url, headers=headers, files=files)
-        except httpx.HTTPError:
-            raise HTTPException(status_code=502, detail="آپلود Worker به Cloudflare ناموفق بود")
-        try:
-            upload_data = upload_resp.json()
-        except ValueError:
-            upload_data = {}
-        if upload_resp.status_code not in (200, 201) or not upload_data.get("success"):
-            errs = upload_data.get("errors") or []
-            msg = errs[0].get("message") if errs else "ساخت Worker ناموفق بود"
-            raise HTTPException(status_code=400, detail=f"خطای Cloudflare: {msg}")
-
-        subdomain_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/workers/scripts/{worker_name}/subdomain"
-        try:
-            enable_resp = await client.post(
-                subdomain_url,
-                headers={**headers, "Content-Type": "application/json"},
-                json={"enabled": True, "previews_enabled": False},
-            )
-            enable_data = enable_resp.json()
-        except (httpx.HTTPError, ValueError):
-            enable_resp = None
-            enable_data = {}
-        if not enable_resp or enable_resp.status_code not in (200, 201) or not enable_data.get("success"):
-            # Best-effort cleanup so a failed deployment does not leave an orphan Worker.
-            with contextlib.suppress(Exception):
-                await client.delete(upload_url, headers=headers)
-            errs = (enable_data.get("errors") or []) if isinstance(enable_data, dict) else []
-            msg = errs[0].get("message") if errs else "فعال‌سازی workers.dev ناموفق بود"
-            raise HTTPException(status_code=400, detail=f"Cloudflare: {msg}")
-
-        try:
-            sub_resp = await client.get(subdomain_url, headers=headers)
-            sub_data = sub_resp.json()
-        except (httpx.HTTPError, ValueError):
-            sub_resp = None
-            sub_data = {}
-        if not sub_resp or sub_resp.status_code != 200 or not sub_data.get("success") or not (sub_data.get("result") or {}).get("enabled"):
-            with contextlib.suppress(Exception):
-                await client.delete(upload_url, headers=headers)
-            raise HTTPException(status_code=400, detail="workers.dev برای این Worker فعال نشد")
-
-        # The account-level workers.dev subdomain is required to construct the
-        # public URL. If the account has not created one yet, create it
-        # automatically (Cloudflare exposes this as a separate account action).
-        account_subdomain_endpoint = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/workers/subdomain"
-        try:
-            account_subdomain_resp = await client.get(account_subdomain_endpoint, headers=headers)
-            account_subdomain_data = account_subdomain_resp.json()
-        except (httpx.HTTPError, ValueError):
-            account_subdomain_resp = None
-            account_subdomain_data = {}
-        subdomain = (account_subdomain_data.get("result") or {}).get("subdomain", "")
-
-        if not subdomain:
-            # Some accounts do not have a workers.dev subdomain until the first
-            # worker deployment. Ask Cloudflare to create the account subdomain
-            # instead of failing after successfully uploading the Worker.
-            try:
-                create_subdomain_resp = await client.put(
-                    account_subdomain_endpoint,
-                    headers={**headers, "Content-Type": "application/json"},
-                    json={"subdomain": worker_name},
-                )
-                create_subdomain_data = create_subdomain_resp.json()
-            except (httpx.HTTPError, ValueError):
-                create_subdomain_resp = None
-                create_subdomain_data = {}
-            if not create_subdomain_resp or create_subdomain_resp.status_code not in (200, 201) or not create_subdomain_data.get("success"):
-                with contextlib.suppress(Exception):
-                    await client.delete(upload_url, headers=headers)
-                errs = create_subdomain_data.get("errors") or [] if isinstance(create_subdomain_data, dict) else []
-                msg = errs[0].get("message") if errs else "ساخت workers.dev subdomain ناموفق بود"
-                raise HTTPException(status_code=400, detail=f"Cloudflare: {msg}")
-            subdomain = (create_subdomain_data.get("result") or {}).get("subdomain", "")
-
-        if not subdomain:
-            with contextlib.suppress(Exception):
-                await client.delete(upload_url, headers=headers)
-            raise HTTPException(status_code=400, detail="Account workers.dev subdomain قابل دریافت نیست")
-
-        worker_url = f"https://{worker_name}.{subdomain}.workers.dev/{gate}"
-        domain_id = ""
-        active_hostname = f"{worker_name}.{subdomain}.workers.dev"
-        active_domain_mode = "workers_dev"
-        if normalized_hostname:
-            domain_resp, domain_data = await _cloudflare_json_request(
-                client, "PUT", f"{_CF_API_BASE}/accounts/{account_id}/workers/domains",
-                headers={**headers, "Content-Type": "application/json"},
-                json={"hostname": normalized_hostname, "service": worker_name},
-            )
-            if domain_resp.status_code not in (200, 201) or not domain_data.get("success"):
-                raise HTTPException(status_code=400, detail=_cf_user_error(domain_resp.status_code, domain_data, "اتصال دامنه سفارشی ناموفق بود"))
-            result = domain_data.get("result") or {}
-            domain_id = str(result.get("id") or "")
-            active_hostname = normalized_hostname
-            active_domain_mode = "custom"
-            worker_url = f"https://{normalized_hostname}/{gate}"
-
-        # Remove a previous custom-domain binding when switching to another
-        # hostname or back to workers.dev. This prevents stale hostnames from
-        # continuing to point at the relay after the user changes the setting.
-        previous_domain_id = (existing_settings.get("cloudflare_worker_domain_id") or "").strip()
-        if previous_domain_id and previous_domain_id != domain_id:
-            old_domain_resp, old_domain_data = await _cloudflare_json_request(
-                client, "DELETE", f"{_CF_API_BASE}/accounts/{account_id}/workers/domains/{previous_domain_id}", headers=headers
-            )
-            if old_domain_resp.status_code not in (200, 204) and not old_domain_data.get("success"):
-                raise HTTPException(status_code=400, detail=_cf_user_error(old_domain_resp.status_code, old_domain_data, "دامنه قبلی حذف نشد؛ تغییر آدرس برای جلوگیری از وضعیت نیمه‌کاره متوقف شد"))
-
-        # Verify the actual deployed relay before writing anything to SQLite.
-        # A freshly created workers.dev route (especially the very first one
-        # on an account, or right after creating the account-level
-        # subdomain) can take well over a few seconds to propagate across
-        # Cloudflare's edge. Retrying only 3x with a 1s gap (~3s total) was
-        # racing that propagation delay: it failed far more often than it
-        # passed, and on failure the newly created Worker was deleted,
-        # forcing a full restart (new random worker name -> propagation
-        # delay all over again) on every retry. Give it a much longer,
-        # backed-off window before giving up.
-        health_url = f"{worker_url}/health/ready"
-        last_status = None
-        attempts = 12
-        for _attempt in range(attempts):
-            try:
-                health_resp = await client.get(health_url, headers={"Cache-Control": "no-cache"})
-                last_status = health_resp.status_code
-                if health_resp.status_code == 200:
-                    break
-            except httpx.HTTPError:
-                pass
-            if _attempt < attempts - 1:
-                await asyncio.sleep(min(2.0 + _attempt * 0.5, 5.0))
-        else:
-            now = datetime.now().isoformat(timespec="seconds")
-            status_text = "inactive" if last_status == 404 else "unreachable"
-            await _db_set_setting("cloudflare_worker_status", status_text)
-            await _db_set_setting("cloudflare_worker_last_checked_at", now)
-            await _db_set_setting("cloudflare_worker_last_status_code", str(last_status or ""))
-            await _db_set_setting("cloudflare_worker_last_error", f"health status={last_status}")
-            if normalized_hostname and domain_id:
-                with contextlib.suppress(Exception):
-                    await client.delete(f"{_CF_API_BASE}/accounts/{account_id}/workers/domains/{domain_id}", headers=headers)
-            raise HTTPException(status_code=502, detail=f"Worker ساخته شد ولی endpoint هنوز سالم نیست (HTTP {last_status or 'بدون پاسخ'}). چند لحظه بعد دوباره وضعیت را بررسی کن.")
-
-        # New Worker is healthy. Reusing the Worker name keeps existing URLs and
-        # custom-domain bindings stable across redeploys.
-        # accumulating unused scripts in the account. Failure to delete the
-        # old script is non-fatal because the new Worker is already
-        # known-good. NOTE: this must stay *inside* the `async with
-        # httpx.AsyncClient(...) as client:` block above — it used to sit
-        # outside it (wrong indentation), which meant `client` had already
-        # been closed by the context manager by the time this ran. Calling
-        # a closed httpx.AsyncClient raises RuntimeError, which is NOT an
-        # httpx.HTTPError, so it wasn't caught here and instead crashed the
-        # whole request with a 500 *before* the new worker_name/worker_url
-        # were ever saved to the database. That made every deploy after the
-        # first successful one fail unconditionally.
-        previous_worker_name = ""
-        try:
-            async with DB_LOCK:
-                settings_snapshot = await asyncio.to_thread(_db_get_settings_sync)
-            previous_worker_name = settings_snapshot.get("cloudflare_worker_name", "") or ""
-        except Exception:
-            previous_worker_name = ""
-        if previous_worker_name and previous_worker_name != worker_name:
-            previous_upload_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/workers/scripts/{previous_worker_name}"
-            try:
-                cleanup_resp = await client.delete(previous_upload_url, headers=headers)
-                if cleanup_resp.status_code not in (200, 204):
-                    logger.warning("Cloudflare old Worker cleanup failed name=%s status=%s", previous_worker_name, cleanup_resp.status_code)
-            except httpx.HTTPError as exc:
-                logger.warning("Cloudflare old Worker cleanup failed name=%s error=%s", previous_worker_name, exc)
-
-    global ACTIVE_WORKER_URL
-    ACTIVE_WORKER_URL = worker_url
-    now = datetime.now().isoformat(timespec="seconds")
-    await _db_set_setting("cloudflare_worker_name", worker_name)
-    await _db_set_setting("cloudflare_worker_url", ACTIVE_WORKER_URL)
-    await _db_set_setting("cloudflare_worker_gate", gate)
-    await _db_set_setting("cloudflare_worker_deployed_at", now)
-    await _db_set_setting("cloudflare_worker_last_checked_at", now)
-    await _db_set_setting("cloudflare_worker_last_status_code", "200")
-    await _db_set_setting("cloudflare_worker_status", "healthy")
-    await _db_set_setting("cloudflare_worker_last_error", "")
-    await _db_set_setting("cloudflare_worker_domain_mode", active_domain_mode)
-    await _db_set_setting("cloudflare_worker_hostname", active_hostname)
-    await _db_set_setting("cloudflare_worker_domain_id", domain_id)
-
-    logger.info("☁️ AUDIT cloudflare worker deployed name=%s mode=%s host=%s ip=%s", worker_name, active_domain_mode, active_hostname, client_ip(request))
-    return {"ok": True, "worker_name": worker_name, "worker_url": ACTIVE_WORKER_URL, "gate": gate, "domain_mode": active_domain_mode, "hostname": active_hostname}
-
-
-async def _probe_active_worker() -> dict:
-    url = ACTIVE_WORKER_URL.strip().rstrip("/")
-    now = datetime.now().isoformat(timespec="seconds")
-    if not url:
-        return {"status": "not_configured", "checked_at": now, "status_code": None, "latency_ms": None, "error": "Worker هنوز تنظیم نشده است"}
-    health_url = f"{url}/health/ready"
-    started = time.perf_counter()
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=4.0), follow_redirects=False) as client:
-            response = await client.get(health_url, headers={"Cache-Control": "no-cache"})
-        latency = round((time.perf_counter() - started) * 1000, 1)
-        if response.status_code == 200:
-            return {"status": "healthy", "checked_at": now, "status_code": 200, "latency_ms": latency, "error": ""}
-        if response.status_code == 404:
-            return {"status": "inactive", "checked_at": now, "status_code": 404, "latency_ms": latency, "error": "Worker endpoint در دسترس نیست یا Route/Domain غیرفعال شده است"}
-        return {"status": "degraded", "checked_at": now, "status_code": response.status_code, "latency_ms": latency, "error": f"Health check با HTTP {response.status_code} برگشت"}
-    except httpx.TimeoutException:
-        return {"status": "unreachable", "checked_at": now, "status_code": None, "latency_ms": None, "error": "پاسخ Worker در مهلت تعیین‌شده نرسید"}
-    except httpx.HTTPError as exc:
-        return {"status": "unreachable", "checked_at": now, "status_code": None, "latency_ms": None, "error": f"ارتباط با Worker برقرار نشد: {str(exc)[:120]}"}
-
-
-@app.get("/api/cloudflare/status")
-async def api_cloudflare_worker_status(_=Depends(require_auth)):
-    # When there is no active Worker URL there is nothing to probe over the
-    # network. Previously this still ran _probe_active_worker(), which always
-    # reports the generic "not_configured" status and then overwrote whatever
-    # was actually stored (e.g. "disabled" right after the admin explicitly
-    # disabled the Worker). That made "disabled" and "deleted" indistinguishable
-    # from "never configured" the moment the dashboard refreshed the status.
-    if not ACTIVE_WORKER_URL.strip():
-        settings = await asyncio.to_thread(_worker_settings_snapshot_sync)
-        return {
-            "ok": False,
-            "status": settings.get("cloudflare_worker_status", "not_configured") or "not_configured",
-            "checked_at": settings.get("cloudflare_worker_last_checked_at", "") or "",
-            "status_code": None,
-            "latency_ms": None,
-            "error": settings.get("cloudflare_worker_last_error", "") or "",
-            "configured": False,
-            "worker_name": settings.get("cloudflare_worker_name", "") or "",
-            "worker_url": "",
-            "deployed_at": settings.get("cloudflare_worker_deployed_at", "") or "",
-            "domain_mode": settings.get("cloudflare_worker_domain_mode", "workers_dev") or "workers_dev",
-            "hostname": settings.get("cloudflare_worker_hostname", "") or "",
-        }
-    result = await _probe_active_worker()
-    await asyncio.to_thread(_save_worker_status_sync, {
-        "cloudflare_worker_status": result["status"],
-        "cloudflare_worker_last_checked_at": result["checked_at"],
-        "cloudflare_worker_last_status_code": str(result.get("status_code") or ""),
-        "cloudflare_worker_last_error": result.get("error", ""),
-    })
-    settings = await asyncio.to_thread(_worker_settings_snapshot_sync)
-    return {
-        "ok": result["status"] == "healthy",
-        **result,
-        "configured": bool(ACTIVE_WORKER_URL.strip()),
-        "worker_name": settings.get("cloudflare_worker_name", "") or "",
-        "worker_url": ACTIVE_WORKER_URL.strip(),
-        "deployed_at": settings.get("cloudflare_worker_deployed_at", "") or "",
-        "domain_mode": settings.get("cloudflare_worker_domain_mode", "workers_dev") or "workers_dev",
-        "hostname": settings.get("cloudflare_worker_hostname", "") or "",
-    }
-
-
-@app.post("/api/cloudflare/domains")
-async def api_cloudflare_domains(payload: CloudflareTokenRequest, _=Depends(require_auth_csrf)):
-    headers = {"Authorization": f"Bearer {payload.api_token.strip()}"}
-    async with httpx.AsyncClient(timeout=20) as client:
-        verify_resp, verify_data = await _cloudflare_json_request(client, "GET", f"{_CF_API_BASE}/user/tokens/verify", headers=headers)
-        if verify_resp.status_code != 200 or not verify_data.get("success"):
-            raise HTTPException(status_code=400, detail="توکن Cloudflare نامعتبر یا منقضی است؛ یک API Token جدید بساز")
-        accounts_resp, accounts_data = await _cloudflare_json_request(client, "GET", f"{_CF_API_BASE}/accounts", headers=headers, params={"page": 1, "per_page": 100})
-        if accounts_resp.status_code != 200 or not accounts_data.get("success"):
-            raise HTTPException(status_code=accounts_resp.status_code, detail=_cf_user_error(accounts_resp.status_code, accounts_data, "خواندن Accountهای Cloudflare ناموفق بود"))
-        accounts = [x for x in (accounts_data.get("result") or []) if x.get("id")]
-        if not accounts:
-            raise HTTPException(status_code=400, detail="این Token به هیچ Cloudflare Account قابل استفاده‌ای دسترسی ندارد")
-        account_id = accounts[0]["id"]
-        domains_resp, domains_data = await _cloudflare_json_request(client, "GET", f"{_CF_API_BASE}/accounts/{account_id}/workers/domains", headers=headers, params={"page": 1, "per_page": 100})
-        if domains_resp.status_code != 200 or not domains_data.get("success"):
-            raise HTTPException(status_code=domains_resp.status_code, detail=_cf_user_error(domains_resp.status_code, domains_data, "خواندن دامنه‌های Worker ناموفق بود"))
-        domains = [{"id": x.get("id", ""), "hostname": x.get("hostname", ""), "service": x.get("service", ""), "zone_name": x.get("zone_name", "")} for x in (domains_data.get("result") or [])]
-        return {"ok": True, "domains": domains}
-
-
-@app.post("/api/cloudflare/domain")
-async def api_cloudflare_set_domain(payload: CloudflareDomainRequest, request: Request, _=Depends(require_auth_csrf)):
-    hostname = _normalize_cf_hostname(payload.hostname)
-    if not hostname:
-        raise HTTPException(status_code=422, detail="دامنه معتبر نیست؛ مثل relay.example.com وارد کن")
-    settings = await asyncio.to_thread(_worker_settings_snapshot_sync)
-    worker_name = (settings.get("cloudflare_worker_name") or "").strip()
-    gate = (settings.get("cloudflare_worker_gate") or "").strip()
-    if not worker_name or not gate:
-        raise HTTPException(status_code=409, detail="اول Worker را بساز، بعد دامنه را تغییر بده")
-    headers = {"Authorization": f"Bearer {payload.api_token.strip()}"}
-    async with httpx.AsyncClient(timeout=20) as client:
-        verify_resp, verify_data = await _cloudflare_json_request(client, "GET", f"{_CF_API_BASE}/user/tokens/verify", headers=headers)
-        if verify_resp.status_code != 200 or not verify_data.get("success"):
-            raise HTTPException(status_code=400, detail="توکن Cloudflare نامعتبر یا منقضی است")
-        accounts_resp, accounts_data = await _cloudflare_json_request(client, "GET", f"{_CF_API_BASE}/accounts", headers=headers, params={"page": 1, "per_page": 100})
-        if accounts_resp.status_code != 200 or not accounts_data.get("success"):
-            raise HTTPException(status_code=accounts_resp.status_code, detail=_cf_user_error(accounts_resp.status_code, accounts_data, "خواندن Account ناموفق بود"))
-        accounts = [x for x in (accounts_data.get("result") or []) if x.get("id")]
-        if not accounts:
-            raise HTTPException(status_code=400, detail="Account قابل استفاده‌ای پیدا نشد")
-        account_id = accounts[0]["id"]
-        attach_resp, attach_data = await _cloudflare_json_request(client, "PUT", f"{_CF_API_BASE}/accounts/{account_id}/workers/domains", headers={**headers, "Content-Type": "application/json"}, json={"hostname": hostname, "service": worker_name})
-        if attach_resp.status_code not in (200, 201) or not attach_data.get("success"):
-            raise HTTPException(status_code=400, detail=_cf_user_error(attach_resp.status_code, attach_data, "اتصال دامنه به Worker ناموفق بود"))
-        new_id = str((attach_data.get("result") or {}).get("id") or "")
-        old_id = (settings.get("cloudflare_worker_domain_id") or "").strip()
-        if old_id and old_id != new_id:
-            old_resp, old_data = await _cloudflare_json_request(client, "DELETE", f"{_CF_API_BASE}/accounts/{account_id}/workers/domains/{old_id}", headers=headers)
-            if old_resp.status_code not in (200, 204) and not old_data.get("success"):
-                with contextlib.suppress(Exception):
-                    await client.delete(f"{_CF_API_BASE}/accounts/{account_id}/workers/domains/{new_id}", headers=headers)
-                raise HTTPException(status_code=400, detail=_cf_user_error(old_resp.status_code, old_data, "دامنه قبلی حذف نشد؛ برای جلوگیری از اتصال هم‌زمان دو دامنه، تغییر لغو شد"))
-    global ACTIVE_WORKER_URL
-    ACTIVE_WORKER_URL = f"https://{hostname}/{gate}"
-    await _db_set_setting("cloudflare_worker_url", ACTIVE_WORKER_URL)
-    await _db_set_setting("cloudflare_worker_domain_mode", "custom")
-    await _db_set_setting("cloudflare_worker_hostname", hostname)
-    await _db_set_setting("cloudflare_worker_domain_id", new_id)
-    await audit("cloudflare_worker_domain_changed", client_ip(request), f"hostname={hostname}")
-    return {"ok": True, "worker_url": ACTIVE_WORKER_URL, "hostname": hostname, "domain_id": new_id}
-
-
-async def _cloudflare_account_id(client: httpx.AsyncClient, headers: dict) -> str:
-    response, data = await _cloudflare_json_request(client, "GET", f"{_CF_API_BASE}/accounts", headers=headers, params={"page": 1, "per_page": 100})
-    if response.status_code != 200 or not data.get("success"):
-        raise HTTPException(status_code=response.status_code, detail=_cf_user_error(response.status_code, data, "خواندن Accountهای Cloudflare ناموفق بود"))
-    accounts = [x for x in (data.get("result") or []) if x.get("id")]
-    if not accounts:
-        raise HTTPException(status_code=400, detail="Token به هیچ Cloudflare Account قابل استفاده‌ای دسترسی ندارد")
-    return accounts[0]["id"]
-
-
-@app.post("/api/cloudflare/disable-worker")
-async def api_cloudflare_disable_worker(payload: CloudflareTokenRequest, request: Request, _=Depends(require_auth_csrf)):
-    settings = await asyncio.to_thread(_worker_settings_snapshot_sync)
-    worker_name = (settings.get("cloudflare_worker_name") or "").strip()
-    if not worker_name:
-        raise HTTPException(status_code=409, detail="Worker ثبت‌شده‌ای برای غیرفعال‌سازی وجود ندارد")
-    headers = {"Authorization": f"Bearer {payload.api_token.strip()}"}
-    async with httpx.AsyncClient(timeout=20) as client:
-        verify_resp, verify_data = await _cloudflare_json_request(client, "GET", f"{_CF_API_BASE}/user/tokens/verify", headers=headers)
-        if verify_resp.status_code != 200 or not verify_data.get("success"):
-            raise HTTPException(status_code=400, detail="توکن Cloudflare نامعتبر یا منقضی است")
-        account_id = await _cloudflare_account_id(client, headers)
-        failures = []
-        domain_id = (settings.get("cloudflare_worker_domain_id") or "").strip()
-        if domain_id:
-            resp, data = await _cloudflare_json_request(client, "DELETE", f"{_CF_API_BASE}/accounts/{account_id}/workers/domains/{domain_id}", headers=headers)
-            if resp.status_code not in (200, 204) and not data.get("success"):
-                failures.append(_cf_user_error(resp.status_code, data, "غیرفعال‌سازی دامنه ناموفق بود"))
-        resp, data = await _cloudflare_json_request(client, "DELETE", f"{_CF_API_BASE}/accounts/{account_id}/workers/scripts/{worker_name}/subdomain", headers=headers)
-        if resp.status_code not in (200, 204) and not data.get("success"):
-            failures.append(_cf_user_error(resp.status_code, data, "غیرفعال‌سازی workers.dev ناموفق بود"))
-    if failures:
-        raise HTTPException(status_code=400, detail=" | ".join(failures))
-    global ACTIVE_WORKER_URL
-    ACTIVE_WORKER_URL = ""
-    now = datetime.now().isoformat(timespec="seconds")
-    for key, value in {"cloudflare_worker_url":"", "cloudflare_worker_status":"disabled", "cloudflare_worker_last_checked_at":now, "cloudflare_worker_last_status_code":"404", "cloudflare_worker_domain_mode":"disabled", "cloudflare_worker_domain_id":"", "cloudflare_worker_last_error":"Worker توسط پنل غیرفعال شد"}.items():
-        await _db_set_setting(key, value)
-    await audit("cloudflare_worker_disabled", client_ip(request), f"worker={worker_name}")
-    return {"ok": True, "status": "disabled"}
-
-
-@app.post("/api/cloudflare/delete-worker")
-async def api_cloudflare_delete_worker(payload: CloudflareTokenRequest, request: Request, _=Depends(require_auth_csrf)):
-    settings = await asyncio.to_thread(_worker_settings_snapshot_sync)
-    worker_name = (settings.get("cloudflare_worker_name") or "").strip()
-    if not worker_name:
-        raise HTTPException(status_code=409, detail="Worker ثبت‌شده‌ای برای حذف وجود ندارد")
-    headers = {"Authorization": f"Bearer {payload.api_token.strip()}"}
-    async with httpx.AsyncClient(timeout=20) as client:
-        verify_resp, verify_data = await _cloudflare_json_request(client, "GET", f"{_CF_API_BASE}/user/tokens/verify", headers=headers)
-        if verify_resp.status_code != 200 or not verify_data.get("success"):
-            raise HTTPException(status_code=400, detail="توکن Cloudflare نامعتبر یا منقضی است")
-        account_id = await _cloudflare_account_id(client, headers)
-        domain_id = (settings.get("cloudflare_worker_domain_id") or "").strip()
-        if domain_id:
-            resp, data = await _cloudflare_json_request(client, "DELETE", f"{_CF_API_BASE}/accounts/{account_id}/workers/domains/{domain_id}", headers=headers)
-            if resp.status_code not in (200, 204) and not data.get("success"):
-                raise HTTPException(status_code=400, detail=_cf_user_error(resp.status_code, data, "دامنه قبل از حذف Worker برداشته نشد"))
-        resp, data = await _cloudflare_json_request(client, "DELETE", f"{_CF_API_BASE}/accounts/{account_id}/workers/scripts/{worker_name}", headers=headers)
-        if resp.status_code not in (200, 204) and not data.get("success", False):
-            raise HTTPException(status_code=resp.status_code, detail=_cf_user_error(resp.status_code, data, "حذف Worker ناموفق بود"))
-    global ACTIVE_WORKER_URL
-    ACTIVE_WORKER_URL = ""
-    now = datetime.now().isoformat(timespec="seconds")
-    for key, value in {"cloudflare_worker_name":"", "cloudflare_worker_url":"", "cloudflare_worker_gate":"", "cloudflare_worker_status":"deleted", "cloudflare_worker_last_status_code":"404", "cloudflare_worker_last_checked_at":now, "cloudflare_worker_domain_mode":"deleted", "cloudflare_worker_hostname":"", "cloudflare_worker_domain_id":"", "cloudflare_worker_last_error":"Worker حذف شد"}.items():
-        await _db_set_setting(key, value)
-    await audit("cloudflare_worker_deleted", client_ip(request), f"worker={worker_name}")
-    return {"ok": True, "status": "deleted"}
-
-
-# ───────────────────────── Stats ─────────────────────────
-
-@app.get("/api/stats")
+# ── Stats ─────────────────────────────────────────────────────────────────────
+@app.get("/stats")
 async def get_stats(_=Depends(require_auth)):
+    async with LINKS_LOCK:
+        snap = dict(LINKS)
     return {
         "active_connections": len(connections),
-        "total_traffic_mb": round(stats["total_bytes"] / (1024 * 1024), 2),
+        "total_traffic_mb": round(stats["total_bytes"] / (1024 ** 2), 2),
         "total_requests": stats["total_requests"],
         "total_errors": stats["total_errors"],
-        "uptime": uptime_str(),
+        "uptime": uptime(),
         "timestamp": datetime.now().isoformat(),
         "hourly": dict(hourly_traffic),
         "recent_errors": list(error_logs)[-10:],
-        "links_count": len(LINKS),
-        "telegram_configured": bool(CONFIG["telegram_bot_token"] and CONFIG["telegram_chat_id"]),
-        "ads_block_enabled": ADS_BLOCK_ENABLED,
-        "ads_blocked_count": stats["ads_blocked"],
+        "links_count": len(snap),
+        "active_links": sum(1 for l in snap.values() if is_link_allowed(l)),
+        "expired_links": sum(1 for l in snap.values() if is_link_expired(l)),
+        "subs_count": len(SUBS),
     }
 
+@app.get("/api/bot-tcp-proxy/domains")
+async def api_bot_tcp_proxy_domains(_=Depends(require_auth)):
+    return {"domains": bottokentcpproxy.get_known_domains()}
 
-# ───────────────────────── Ads Blocker settings ─────────────────────────
-
-class AdsBlockSettingsRequest(BaseModel):
-    enabled: bool
-    custom_domains: list[str] | None = None
-
-
-@app.get("/api/settings/ads-block")
-async def api_get_ads_block(_=Depends(require_auth)):
-    return {
-        "enabled": ADS_BLOCK_ENABLED,
-        "custom_domains": sorted(ADS_BLOCK_CUSTOM_DOMAINS),
-        "builtin_count": len(_BUILTIN_AD_DOMAINS),
-        "blocked_count": stats["ads_blocked"],
-    }
-
-
-@app.post("/api/settings/ads-block")
-async def api_set_ads_block(payload: AdsBlockSettingsRequest, request: Request, _=Depends(require_auth_csrf)):
-    global ADS_BLOCK_ENABLED, ADS_BLOCK_CUSTOM_DOMAINS
-
-    if payload.custom_domains is not None:
-        if len(payload.custom_domains) > 500:
-            raise HTTPException(status_code=422, detail="حداکثر ۵۰۰ دامنه سفارشی مجاز است")
-        cleaned = set()
-        for raw in payload.custom_domains:
-            if not isinstance(raw, str):
-                continue
-            d = _normalize_ad_domain(raw)
-            if not d or len(d) > 253 or " " in d:
-                continue
-            cleaned.add(d)
-        ADS_BLOCK_CUSTOM_DOMAINS = cleaned
-        await _db_set_setting("ads_block_custom_domains", json.dumps(sorted(ADS_BLOCK_CUSTOM_DOMAINS)))
-
-    ADS_BLOCK_ENABLED = bool(payload.enabled)
-    await _db_set_setting("ads_block_enabled", "1" if ADS_BLOCK_ENABLED else "0")
-    await audit("ads_block_toggle", client_ip(request), f"enabled={ADS_BLOCK_ENABLED}")
-
-    return {
-        "enabled": ADS_BLOCK_ENABLED,
-        "custom_domains": sorted(ADS_BLOCK_CUSTOM_DOMAINS),
-        "builtin_count": len(_BUILTIN_AD_DOMAINS),
-        "blocked_count": stats["ads_blocked"],
-    }
-
-
-@app.get("/api/audit")
-async def list_audit(limit: int = 100, _=Depends(require_auth)):
-    limit = max(1, min(limit, 500))
-    rows = await asyncio.to_thread(_db_recent_audit_sync, limit)
-    return {"events": [{"created_at": r[0], "action": r[1], "ip": r[2], "details": r[3]} for r in rows]}
-
-
-@app.get("/api/connections")
-async def list_connections(_=Depends(require_auth)):
-    """اتصالات فعالِ زنده به‌همراه عنوان لینکِ مربوطه، برای نمایش لحظه‌ای در
-    صفحه‌ی «اتصالات فعال» داشبورد (قبلاً این صفحه هیچ‌وقت توسط JS پر نمی‌شد)."""
-    async with LINKS_LOCK:
-        labels = {uid: data["label"] for uid, data in LINKS.items()}
-    result = []
-    for conn_id, info in connections.items():
-        result.append({
-            "conn_id": conn_id,
-            "uuid": info["uuid"],
-            "label": labels.get(info["uuid"], "لینک حذف‌شده"),
-            "connected_at": info["connected_at"],
-            "bytes": info["bytes"],
-        })
-    result.sort(key=lambda x: x["connected_at"], reverse=True)
-    return {"connections": result}
-
-
-@app.post("/api/notify/test")
-async def send_test_notification(_=Depends(require_auth_csrf)):
-    if not (CONFIG["telegram_bot_token"] and CONFIG["telegram_chat_id"]):
-        raise HTTPException(status_code=400, detail="TELEGRAM_BOT_TOKEN یا TELEGRAM_CHAT_ID تنظیم نشده است")
-    ok = await send_telegram_message("✅ Vortex Gateway: این یک پیام تستی است. اعلان‌ها درست کار می‌کنند.")
-    if not ok:
-        raise HTTPException(status_code=502, detail="ارسال پیام تلگرام ناموفق بود؛ توکن/chat_id را بررسی کنید")
+@app.post("/api/bot-tcp-proxy/start")
+async def api_bot_tcp_proxy_start(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    token = str(body.get("token", "")).strip()
+    # هر لینک MTProto پورت جدای خودش رو داره (per-instance)، پس پورت باید
+    # از ورودی کاربر/فرانت (لینکی که TCP Proxy براش ساخته می‌شه) بیاد.
+    uid = str(body.get("uuid") or "").strip()
+    port = body.get("port")
+    if port is None and uid:
+        async with LINKS_LOCK:
+            link = LINKS.get(uid)
+            port = link.get("mtproto_port") if link else None
+    if port is None:
+        raise HTTPException(status_code=400, detail="پورت (یا uuid لینک) مشخص نشده")
+    port = int(port)
+    reachable_domains = body.get("reachable_domains") or []
+    try:
+        bottokentcpproxy.start_job(token, port, reachable_domains=reachable_domains)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    log_activity("system", "جست‌وجوی TCP Proxy آغاز شد", "info")
     return {"ok": True}
 
-
-# ───────────────────────── Link management ─────────────────────────
-# مدل‌های Pydantic ورودی API را قبل از رسیدن به بدنه‌ی هندلر اعتبارسنجی
-# می‌کنند (نوع/محدوده‌ی مقادیر)؛ قبلاً با body.get(...) خام پارس می‌شد که
-# مثلاً یک مقدار غیرعددی برای limit_value باعث ValueError کنترل‌نشده (خطای
-# ۵۰۰ خام) می‌شد. حالا چنین ورودی‌ای همان‌جا با پیام ۴۲۲ واضح رد می‌شود.
-
-SizeUnit = Literal["GB", "MB", "KB"]
-SpeedUnit = Literal["KBps", "MBps"]
-
-
-RouteVia = Literal["auto", "railway", "cloudflare"]
-
-
-class LinkCreateRequest(BaseModel):
-    label: str = "لینک جدید"
-    limit_value: float = 0
-    limit_unit: SizeUnit = "GB"
-    expires_at: str | None = None
-    speed_limit_value: float = 0
-    speed_limit_unit: SpeedUnit = "KBps"
-    route_via: RouteVia = "railway"
-
-
-class LinkUpdateRequest(BaseModel):
-    active: bool | None = None
-    limit_value: float | None = None
-    limit_unit: SizeUnit = "GB"
-    reset_usage: bool | None = None
-    label: str | None = None
-    expires_at: str | None = None
-    speed_limit_value: float | None = None
-    speed_limit_unit: SpeedUnit = "KBps"
-    route_via: RouteVia | None = None
-
-
-def _require_finite(value: float, field_name: str) -> float:
-    if not math.isfinite(value):
-        raise HTTPException(status_code=422, detail=f"{field_name} must be finite")
-    return value
-
-
-SQLITE_INT64_MAX = 9_223_372_036_854_775_807
-
-
-def _limit_value_to_bytes(value: float, unit: str) -> int:
-    """Convert a traffic limit to bytes; non-positive values mean unlimited."""
-    value = _require_finite(value, "limit_value")
-    if value <= 0:
-        return 0
+@app.post("/api/mtproto/fix-proxy")
+async def api_mtproto_fix_proxy(request: Request, _=Depends(require_auth)):
+    """راه مستقیم برای درست‌کردن لینک‌های MTProto بدون TCP Proxy:
+    توکن Railway رو (اگه فرستاده بشه) ذخیره می‌کنه و بعد برای همه‌ی لینک‌های
+    MTProto که هنوز TCP Proxy عمومی ندارن، یکی می‌سازه — بدون نیاز به طی‌کردن
+    کل فرآیند جست‌وجوی دامنه."""
+    body = {}
     try:
-        result = parse_size_to_bytes(value, unit)
-    except (OverflowError, ValueError):
-        raise HTTPException(status_code=422, detail="limit_value is too large")
-    if result > SQLITE_INT64_MAX:
-        raise HTTPException(status_code=422, detail="limit_value is too large")
-    return result
+        body = await request.json()
+    except Exception:
+        pass
+    token = str(body.get("token", "")).strip()
+    if token:
+        bottokentcpproxy.save_token(token)
+
+    if not bottokentcpproxy.has_saved_token():
+        raise HTTPException(status_code=400, detail="توکن Railway ذخیره نشده — آن را در همین درخواست بفرستید")
+
+    async with LINKS_LOCK:
+        targets = [
+            (uid, d.get("mtproto_port"), d.get("label", ""))
+            for uid, d in LINKS.items()
+            if d.get("protocol") == "mtproto" and not d.get("mtproto_public_host")
+        ]
+
+    fixed, failed = [], []
+    for uid, port, label in targets:
+        if not port:
+            failed.append({"uuid": uid, "label": label, "error": "پورت داخلی ندارد (instance اجرا نشده)"})
+            continue
+        try:
+            pub = await bottokentcpproxy.create_public_proxy_for_port(int(port))
+        except Exception as exc:
+            failed.append({"uuid": uid, "label": label, "error": str(exc)})
+            continue
+        async with LINKS_LOCK:
+            if uid in LINKS:
+                LINKS[uid]["mtproto_public_host"] = pub["domain"]
+                LINKS[uid]["mtproto_public_port"] = pub["port"]
+                LINKS[uid]["mtproto_proxy_id"] = pub["id"]
+                LINKS[uid]["mtproto_public_pending"] = False
+        fixed.append({
+            "uuid": uid, "label": label,
+            "host": pub["domain"], "port": pub["port"],
+            "link": generate_share_link(uid, get_host(), remark=f"RVG-{label}", protocol="mtproto"),
+        })
+        log_activity("link", f"TCP Proxy عمومی «{label}» ساخته شد ({pub['domain']}:{pub['port']})", "ok")
+
+    asyncio.create_task(save_state())
+    return {"ok": True, "fixed": fixed, "failed": failed}
 
 
-def _speed_value_to_bps(value: float, unit: str) -> int:
-    """Convert a speed limit to bytes per second; non-positive means unlimited."""
-    value = _require_finite(value, "speed_limit_value")
-    if value <= 0:
-        return 0
+@app.get("/api/mtproto/{uid}/stats")
+async def api_mtproto_stats(uid: str, _=Depends(require_auth)):
+    """آمار خام خود باینری mtproto-proxy برای این لینک.
+    اگه total_special_connections صفر بمونه حتی بعد از تلاش برای اتصال، یعنی
+    هیچ پکتی به پروسه نمی‌رسه (مشکل مسیر شبکه/TCP Proxy). اگه بالا بره ولی
+    اتصال برقرار نشه، یعنی پکت می‌رسه و مشکل در handshake/سکرت است."""
+    async with LINKS_LOCK:
+        if uid not in LINKS:
+            raise HTTPException(status_code=404, detail="link not found")
+    return await mtproto.get_stats(uid)
+
+
+@app.post("/api/zeus-proxy/create")
+async def api_zeus_proxy_create(request: Request, _=Depends(require_auth)):
+    """ساخت پروکسی Zeus با پشتیبانی از محدودیت حجم، انقضا و اتصال per IP."""
+    body = {}
     try:
-        result = parse_speed_to_bps(value, unit)
-    except (OverflowError, ValueError):
-        raise HTTPException(status_code=422, detail="speed_limit_value is too large")
-    if result > SQLITE_INT64_MAX:
-        raise HTTPException(status_code=422, detail="speed_limit_value is too large")
-    return result
+        body = await request.json()
+    except Exception:
+        pass
+    token = str(body.get("token", "")).strip()
+    # ── کانفیگ‌های اختیاری ──
+    traffic_limit_gb = body.get("traffic_limit_gb")
+    expires_days = body.get("expires_days")
+    max_connections_per_ip = body.get("max_connections_per_ip")
+    try:
+        result = await zeussocks5.create_zeus_proxy(
+            token or None,
+            traffic_limit_gb=float(traffic_limit_gb) if traffic_limit_gb is not None else None,
+            expires_days=int(expires_days) if expires_days is not None else None,
+            max_connections_per_ip=int(max_connections_per_ip) if max_connections_per_ip is not None else None,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"ساخت پروکسی Zeus ناموفق بود: {exc}")
+    log_activity("system", f"پروکسی Zeus ساخته شد ({result['domain']}:{result['public_port']})", "ok")
+    return {"ok": True, **result}
+
+@app.get("/api/zeus-proxy/status")
+async def api_zeus_proxy_status(_=Depends(require_auth)):
+    return zeussocks5.get_zeus_status()
+
+@app.post("/api/zeus-proxy/delete")
+async def api_zeus_proxy_delete(_=Depends(require_auth)):
+    await zeussocks5.delete_zeus_proxy()
+    log_activity("system", "پروکسی Zeus حذف شد", "warn")
+    return {"ok": True}
+
+@app.post("/api/zeus-proxy/config")
+async def api_zeus_proxy_config(request: Request, _=Depends(require_auth)):
+    """تغییر کانفیگ‌های پروکسی Zeus (حجم/انقضا/اتصال per IP) بدون ری‌استارت."""
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    traffic_limit_gb = body.get("traffic_limit_gb")
+    expires_days = body.get("expires_days")
+    max_connections_per_ip = body.get("max_connections_per_ip")
+    cfg = zeussocks5.update_zeus_config(
+        traffic_limit_gb=float(traffic_limit_gb) if traffic_limit_gb is not None else None,
+        expires_days=int(expires_days) if expires_days is not None else None,
+        max_connections_per_ip=int(max_connections_per_ip) if max_connections_per_ip is not None else None,
+    )
+    log_activity("system", f"کانفیگ پروکسی Zeus آپدیت شد", "ok")
+    return {"ok": True, "config": cfg}
+@app.post("/api/bot-tcp-proxy/stop")
+async def api_bot_tcp_proxy_stop(_=Depends(require_auth)):
+    stopped = bottokentcpproxy.stop_job()
+    if stopped:
+        log_activity("system", "جست‌وجوی TCP Proxy متوقف شد", "warn")
+    return {"ok": True, "stopped": stopped}
+
+@app.get("/api/bot-tcp-proxy/status")
+async def api_bot_tcp_proxy_status(_=Depends(require_auth)):
+    return bottokentcpproxy.get_status()
+
+@app.post("/api/bot-tcp-proxy/attach")
+async def api_bot_tcp_proxy_attach(request: Request, _=Depends(require_auth)):
+    """وقتی جست‌وجو یک دامنه‌ی سالم پیدا کرد (phase=='done')، این دامنه/پورت به‌عنوان
+    TCP Proxy عمومیِ همون لینک MTProto مشخص‌شده (با uuid) ثبت می‌شود. اگر uuid
+    داده نشده باشه و هیچ لینک MTProtoای وجود نداشته باشه، یکی پیش‌فرض ساخته می‌شود."""
+    status = bottokentcpproxy.get_status()
+    chosen = status.get("result")
+    if status.get("phase") != "done" or not chosen:
+        raise HTTPException(status_code=409, detail="هنوز نتیجه‌ای برای ساخت پروکسی آماده نیست")
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    label = str(body.get("label") or "").strip() or f"TCP-{chosen['domain'].split('.')[0]}"
+    uid = str(body.get("uuid") or "").strip() or None
+
+    attached_link = None
+    if not uid:
+        async with LINKS_LOCK:
+            existing = next((u for u, d in LINKS.items() if d.get("protocol") == "mtproto"), None)
+        uid = existing
+
+    if not uid:
+        uid = generate_uuid()
+        secret = mtproto.generate_secret()
+        link_data = {
+            "label": label, "limit_bytes": 0, "used_bytes": 0,
+            "created_at": datetime.now().isoformat(),
+            "alpn": "h2,http/1.1", "fingerprint": "chrome", "active": True,
+            "expires_at": None, "note": "", "is_default": False, "sub_id": None,
+            "protocol": "mtproto", "ad_tag": None, "mtproto_secret": secret,
+        }
+        async with LINKS_LOCK:
+            LINKS[uid] = link_data
+        try:
+            inst = await mtproto.start_instance(uid, secret=secret, ad_tag=None)
+        except Exception as exc:
+            logger.error(f"راه‌اندازی mtproto ناموفق بود: {exc}")
+            raise HTTPException(status_code=502, detail=f"راه‌اندازی MTProto ناموفق بود: {exc}")
+        async with LINKS_LOCK:
+            LINKS[uid]["mtproto_port"] = inst["port"]
+            LINKS[uid]["mtproto_secret"] = inst["secret"]
+        attached_link = {"uuid": uid, "label": label}
+
+    old_proxy_id = None
+    async with LINKS_LOCK:
+        link = LINKS.get(uid)
+        if link is None:
+            raise HTTPException(status_code=404, detail="لینک پیدا نشد")
+        old_proxy_id = link.get("mtproto_proxy_id")
+        link["mtproto_public_host"] = chosen["domain"]
+        link["mtproto_public_port"] = chosen["port"]
+        link["mtproto_proxy_id"] = chosen["id"]
+        link["mtproto_public_pending"] = False
+        cur_label = link.get("label", label)
+
+    if old_proxy_id and old_proxy_id != chosen["id"]:
+        asyncio.create_task(bottokentcpproxy.delete_public_proxy(old_proxy_id))
+
+    asyncio.create_task(save_state())
+    host = get_host()
+    share_link = generate_share_link(uid, host, remark=f"RVG-{cur_label}", protocol="mtproto")
+    if not attached_link:
+        attached_link = {"uuid": uid, "label": cur_label}
+    log_activity(
+        "link",
+        f"TCP Proxy عمومی «{cur_label}» با دامنه‌ی {chosen['domain']}:{chosen['port']} تنظیم شد",
+        "ok",
+    )
+    return {
+        "ok": True,
+        "result": chosen,
+        "attached_link": attached_link,
+        "share_link": share_link,
+    }
 
 
-@app.post("/api/links")
-async def create_link(payload: LinkCreateRequest, request: Request, _=Depends(require_auth_csrf)):
-    label = payload.label.strip()[:60] or "لینک جدید"
-    limit_bytes = _limit_value_to_bytes(payload.limit_value, payload.limit_unit)
-    expires_at = parse_expiry_input(payload.expires_at)
-    if payload.expires_at and expires_at is None:
-        raise HTTPException(status_code=422, detail="invalid expires_at")
-    speed_limit_bps = _speed_value_to_bps(payload.speed_limit_value, payload.speed_limit_unit)
+@app.post("/api/domain-gen/start")
+async def api_domain_gen_start(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    token = str(body.get("token", "")).strip()
+    port = int(body.get("port") or CONFIG["port"])
+    count = int(body.get("count") or 10)
+    try:
+        botgeneratedomin.start_job(token, port, target_count=count)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    log_activity("system", f"ساخت {count} دامنه آغاز شد", "info")
+    return {"ok": True}
+
+@app.post("/api/domain-gen/stop")
+async def api_domain_gen_stop(_=Depends(require_auth)):
+    stopped = botgeneratedomin.stop_job()
+    if stopped:
+        log_activity("system", "ساخت دامنه متوقف شد", "warn")
+    return {"ok": True, "stopped": stopped}
+
+@app.get("/api/domain-gen/status")
+async def api_domain_gen_status(_=Depends(require_auth)):
+    return botgeneratedomin.get_status()
+
+# ── System resources (CPU/RAM/Swap/Disk/Temp) ─────────────────────────────────
+def _read_system_stats() -> dict:
+    """بلاک‌کننده — با asyncio.to_thread صدا زده می‌شه تا event loop رو قفل نکنه."""
+    if psutil is None:
+        return {"available": False}
+
+    cpu_total = psutil.cpu_percent(interval=0.2)
+    cpu_per_core = psutil.cpu_percent(interval=None, percpu=True)
+    try:
+        freq = psutil.cpu_freq()
+        cpu_freq_mhz = round(freq.current) if freq else None
+    except Exception:
+        cpu_freq_mhz = None
+
+    vm = psutil.virtual_memory()
+    sw = psutil.swap_memory()
+    try:
+        disk = psutil.disk_usage("/")
+    except Exception:
+        disk = None
+
+    temps = []
+    try:
+        raw_temps = psutil.sensors_temperatures() if hasattr(psutil, "sensors_temperatures") else {}
+        for name, entries in (raw_temps or {}).items():
+            for e in entries:
+                temps.append({
+                    "label": e.label or name,
+                    "current": round(e.current, 1) if e.current is not None else None,
+                    "high": round(e.high, 1) if e.high else None,
+                    "critical": round(e.critical, 1) if e.critical else None,
+                })
+    except Exception:
+        temps = []
+
+    load_avg = None
+    try:
+        if hasattr(os, "getloadavg"):
+            load_avg = list(round(x, 2) for x in os.getloadavg())
+    except Exception:
+        load_avg = None
+
+    return {
+        "available": True,
+        "cpu": {
+            "percent": round(cpu_total, 1),
+            "per_core": [round(c, 1) for c in cpu_per_core],
+            "core_count": psutil.cpu_count(logical=True) or len(cpu_per_core),
+            "freq_mhz": cpu_freq_mhz,
+            "load_avg": load_avg,
+        },
+        "ram": {
+            "percent": round(vm.percent, 1),
+            "used": vm.used,
+            "total": vm.total,
+            "used_fmt": fmt_bytes(vm.used),
+            "total_fmt": fmt_bytes(vm.total),
+        },
+        "swap": {
+            "percent": round(sw.percent, 1),
+            "used": sw.used,
+            "total": sw.total,
+            "used_fmt": fmt_bytes(sw.used),
+            "total_fmt": fmt_bytes(sw.total),
+        },
+        "disk": ({
+            "percent": round(disk.percent, 1),
+            "used": disk.used,
+            "total": disk.total,
+            "used_fmt": fmt_bytes(disk.used),
+            "total_fmt": fmt_bytes(disk.total),
+        } if disk else None),
+        "temps": temps,
+    }
+
+@app.get("/api/system")
+async def get_system_stats(_=Depends(require_auth)):
+    return await asyncio.to_thread(_read_system_stats)
+
+# ── Activity Logs ─────────────────────────────────────────────────────────────
+@app.get("/api/activity")
+async def get_activity(_=Depends(require_auth)):
+    return {"logs": list(activity_logs)[-150:]}
+
+# ── Live connections (with IP) ────────────────────────────────────────────────
+@app.get("/api/connections")
+async def get_connections(_=Depends(require_auth)):
+    async with LINKS_LOCK:
+        snap = dict(LINKS)
+    grouped: dict[str, dict] = {}
+    for conn_id, c in connections.items():
+        ip = c.get("ip", "نامشخص")
+        link = snap.get(c.get("uuid"))
+        label = link.get("label") if link else "نامشخص"
+        g = grouped.get(ip)
+        if g is None:
+            g = {
+                "ip": ip,
+                "sessions": 0,
+                "bytes": 0,
+                "labels": set(),
+                "transports": set(),
+                "first_connected_at": c.get("connected_at"),
+                "last_connected_at": c.get("connected_at"),
+            }
+            grouped[ip] = g
+        g["sessions"] += 1
+        g["bytes"] += c.get("bytes", 0)
+        g["labels"].add(label)
+        g["transports"].add(c.get("transport", "vless-ws"))
+        ca = c.get("connected_at")
+        if ca:
+            if not g["first_connected_at"] or ca < g["first_connected_at"]:
+                g["first_connected_at"] = ca
+            if not g["last_connected_at"] or ca > g["last_connected_at"]:
+                g["last_connected_at"] = ca
+    for uid, link in snap.items():
+        if link.get("protocol") == "mtproto":
+            label = link.get("label", "نامشخص")
+            for c in mtproto.get_instance_connections(uid):
+                ip = c["ip"]
+                g = grouped.get(ip)
+                if g is None:
+                    g = {
+                        "ip": ip, "sessions": 0, "bytes": 0,
+                        "labels": set(), "transports": set(),
+                        "first_connected_at": None, "last_connected_at": None,
+                    }
+                    grouped[ip] = g
+                g["sessions"] += 1
+                g["labels"].add(label)
+                g["transports"].add("mtproto")
+    result = []
+    for ip, g in grouped.items():
+        result.append({
+            "ip": ip,
+            "sessions": g["sessions"],
+            "labels": sorted(g["labels"]),
+            "label": " · ".join(sorted(g["labels"])) if g["labels"] else "نامشخص",
+            "transports": sorted(g["transports"]),
+            "bytes": g["bytes"],
+            "bytes_fmt": fmt_bytes(g["bytes"]),
+            "connected_at": g["first_connected_at"],
+            "last_connected_at": g["last_connected_at"],
+        })
+    result.sort(key=lambda x: x.get("last_connected_at") or "", reverse=True)
+    return {
+        "connections": result,
+        "count": len(result),
+        "raw_count": len(connections),
+    }
+
+# ── Link Management ───────────────────────────────────────────────────────────
+async def _create_link_core(body: dict) -> dict:
+    label = (body.get("label") or "لینک جدید").strip()[:60]
+    lv = float(body.get("limit_value") or 0)
+    lu = body.get("limit_unit") or "GB"
+    limit_bytes = 0 if lv <= 0 else parse_size_to_bytes(lv, lu)
+    exp_days = int(body.get("expires_days") or 0)
+    expires_at = (datetime.now() + timedelta(days=exp_days)).isoformat() if exp_days > 0 else None
+    note = (body.get("note") or "").strip()[:200]
+    sub_id = body.get("sub_id") or None
+    protocol = body.get("protocol") or DEFAULT_PROTOCOL
+    if protocol not in PROTOCOLS:
+        protocol = DEFAULT_PROTOCOL
+
+    alpn_val = str(body.get("alpn") or "h2,http/1.1").strip()[:60]
+    fp_val = str(body.get("fingerprint") or "chrome").strip()[:20]
+    if fp_val not in ("chrome", "firefox", "ios"):
+        fp_val = "chrome"
+
     uid = generate_uuid()
-    snapshot = {
+    link_data = {
         "label": label,
         "limit_bytes": limit_bytes,
         "used_bytes": 0,
         "created_at": datetime.now().isoformat(),
+        "alpn": alpn_val,
+        "fingerprint": fp_val,
         "active": True,
         "expires_at": expires_at,
-        "speed_limit_bps": speed_limit_bps,
-        "subscription_token": secrets.token_urlsafe(32),
-        "route_via": payload.route_via,
+        "note": note,
+        "is_default": False,
+        "sub_id": sub_id,
+        "protocol": protocol,
+        "ad_tag": None,
     }
+
+    if protocol == "mtproto":
+        raw_port = body.get("mtproto_port")
+        manual_port = int(raw_port) if raw_port not in (None, "", 0, "0") else None
+        if manual_port is not None and not (1 <= manual_port <= 65535):
+            raise HTTPException(status_code=400, detail="شماره پورت نامعتبر است")
+        raw_domain = (body.get("mtproto_domain") or "").strip()
+        domain = mtproto.sanitize_domain(raw_domain)
+        try:
+            inst = await mtproto.start_instance(
+                uid,
+                domain=domain,
+                preferred_port=manual_port,
+                force_port=manual_port is not None,
+                ad_tag=None,
+            )
+        except RuntimeError as exc:
+            logger.error(f"راه‌اندازی MTProto ناموفق برای {uid[:8]}: {exc}")
+            raise HTTPException(status_code=409, detail=str(exc))
+        except Exception as exc:
+            logger.error(f"راه‌اندازی MTProto ناموفق برای {uid[:8]}: {exc}")
+            raise HTTPException(status_code=502, detail=f"راه‌اندازی MTProto ناموفق: {exc}")
+        link_data["mtproto_port"] = inst["port"]
+        link_data["mtproto_secret"] = inst["secret"]
+        link_data["mtproto_domain"] = inst["domain"]
+        link_data["mtproto_manual_port"] = manual_port is not None
+
+        # ── آدرس عمومی دستی ──────────────────────────────────────────────────
+        # اگه کاربر TCP Proxy رو خودش از داشبورد Railway ساخته باشه، دامنه و پورت
+        # عمومیش رو مستقیم اینجا وارد می‌کنه (مثل proxy.rlwy.net:12345). در این
+        # حالت اصلاً سراغ ساخت خودکار/توکن نمی‌ریم.
+        pub_host = (body.get("mtproto_public_host") or "").strip()
+        raw_pub_port = body.get("mtproto_public_port")
+        try:
+            pub_port = int(raw_pub_port) if raw_pub_port not in (None, "", 0, "0") else None
+        except (TypeError, ValueError):
+            pub_port = None
+        if pub_host and pub_port:
+            link_data["mtproto_public_host"] = pub_host
+            link_data["mtproto_public_port"] = pub_port
+            link_data["mtproto_public_pending"] = False
+        elif bottokentcpproxy.has_saved_token():
+            link_data["mtproto_public_pending"] = True
+            asyncio.create_task(_attach_mtproto_public_proxy(uid, inst["port"], label))
+        else:
+            # بدون توکن Railway هیچ TCP Proxy عمومی ساخته نمی‌شه، یعنی این لینک
+            # از بیرون اصلاً قابل دسترس نیست. قبلاً این حالت بی‌صدا رد می‌شد و
+            # کاربر یه لینک ظاهراً سالم ولی کاملاً مرده می‌گرفت.
+            link_data["mtproto_public_pending"] = False
+            logger.error(
+                f"MTProto[{uid[:8]}]: توکن Railway ذخیره نشده — TCP Proxy عمومی ساخته نشد "
+                f"و این لینک از بیرون قابل استفاده نیست. ابتدا از مودال «Bot TCP Proxy» "
+                f"توکن Railway را وارد کنید."
+            )
+            log_activity(
+                "link",
+                f"«{label}» ساخته شد ولی TCP Proxy ندارد (توکن Railway ذخیره نشده) — لینک کار نمی‌کند",
+                "err",
+            )
+
+    if protocol == "shadowsocks":
+        ss_cipher = body.get("ss_cipher") or DEFAULT_CIPHER
+        if ss_cipher not in CIPHERS:
+            ss_cipher = DEFAULT_CIPHER
+        link_data["ss_cipher"] = ss_cipher
+        link_data["ss_password"] = secrets.token_urlsafe(16)
+    
     async with LINKS_LOCK:
-        # Persist first.  If SQLite rejects the write, no partially-created link
-        # remains visible in memory.
-        await _db_upsert_link(uid, snapshot)
-        LINKS[uid] = dict(snapshot)
-        SUBSCRIPTION_INDEX[snapshot["subscription_token"]] = uid
-    logger.info("🔗 AUDIT link created uid=%s label=%r ip=%s", uid[:8], label, client_ip(request))
-    asyncio.create_task(audit("link_created", client_ip(request), f"uid={uid} label={label}"))
+        LINKS[uid] = link_data
+
+    if sub_id:
+        async with SUBS_LOCK:
+            if sub_id in SUBS:
+                ids = SUBS[sub_id].setdefault("link_ids", [])
+                if uid not in ids:
+                    ids.append(uid)
+
+    asyncio.create_task(save_state())
+    log_activity("link", f"کانفیگ «{label}» ساخته شد", "ok")
     host = get_host()
     return {
         "uuid": uid,
-        "label": label,
-        "limit_bytes": limit_bytes,
-        "used_bytes": 0,
-        "active": True,
-        "created_at": snapshot["created_at"],
-        "expires_at": expires_at,
-        "speed_limit_bps": speed_limit_bps,
-        "route_via": payload.route_via,
-        "vless_link": generate_vless_link(uid, host, remark=f"Vortex-{label}"),
-        "sub_link": generate_sub_url(uid, host),
+        **LINKS[uid],
+        "expired": False,
+        "vless_link": generate_share_link(uid, host, remark=f"RVG-{label}", protocol=protocol),
+        "sub_url": f"https://{host}/sub/{uid}",
     }
 
+@app.post("/api/links")
+async def create_link(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    return await _create_link_core(body)
+
+@app.post("/api/node/links")
+async def node_create_link(request: Request, key_id: str = Depends(require_node_key)):
+    await _require_node_manage(key_id)
+    body = await request.json()
+    # sub_id در اینجا به گروهِ محلیِ همین نود اشاره دارد (نه پنل مرکزی)؛ اگر معتبر نباشد نادیده گرفته می‌شود
+    return await _create_link_core(body)
 
 @app.get("/api/links")
 async def list_links(_=Depends(require_auth)):
     host = get_host()
-    result = []
     async with LINKS_LOCK:
-        for uid, data in LINKS.items():
-            result.append({
-                "uuid": uid,
-                "label": data["label"],
-                "limit_bytes": data["limit_bytes"],
-                "used_bytes": data["used_bytes"],
-                "active": data["active"],
-                "created_at": data["created_at"],
-                "expires_at": data.get("expires_at"),
-                "speed_limit_bps": data.get("speed_limit_bps", 0),
-                "expired": is_link_expired(data),
-                "route_via": data.get("route_via") or "railway",
-                "vless_link": generate_vless_link(uid, host, remark=f"Vortex-{data['label']}"),
-                "sub_link": generate_sub_url(uid, host),
-            })
+        snap = dict(LINKS)
+    result = []
+    for uid, d in snap.items():
+        proto = d.get("protocol", DEFAULT_PROTOCOL)
+        extra = {}
+        if proto == "mtproto":
+            # هر لینک MTProto حالا instance/پورت/TCP-Proxy مستقل خودش رو داره
+            extra = {
+                "mtproto_public_host": d.get("mtproto_public_host"),
+                "mtproto_public_port": d.get("mtproto_public_port"),
+                "mtproto_public_pending": bool(
+                    d.get("mtproto_public_pending")
+                    or (not d.get("mtproto_manual_port") and bottokentcpproxy.has_saved_token()
+                        and not d.get("mtproto_public_host"))
+                ),
+            }
+        result.append({
+            "uuid": uid,
+            **d,
+            **extra,
+            "protocol": proto,
+            "expired": is_link_expired(d),
+            "vless_link": generate_share_link(uid, host, remark=f"RVG-{d['label']}", protocol=proto),
+            "sub_url": f"https://{host}/sub/{uid}",
+        })
     result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"links": result}
 
+@app.patch("/api/links/{uid}")
+async def update_link(uid: str, request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    mtproto_action = None
+    new_sub = "UNCHANGED"
 
-@app.get("/api/links/{uid}/traffic")
-async def get_link_traffic(uid: str, _=Depends(require_auth)):
     async with LINKS_LOCK:
         if uid not in LINKS:
             raise HTTPException(status_code=404, detail="link not found")
-    return {"hourly": dict(link_hourly_traffic.get(uid, {}))}
+        link = LINKS[uid]
+        old_sub = link.get("sub_id")
+        label = link.get("label")
 
+        if "active" in body:
+            new_active = bool(body["active"])
+            changed = new_active != link.get("active", True)
+            link["active"] = new_active
+            log_activity("link", f"کانفیگ «{label}» {'فعال' if new_active else 'غیرفعال'} شد", "ok" if new_active else "warn")
+            if changed and link.get("protocol") == "mtproto":
+                mtproto_action = ("start" if new_active else "stop", dict(link))
 
-@app.patch("/api/links/{uid}")
-async def update_link(uid: str, payload: LinkUpdateRequest, request: Request, _=Depends(require_auth_csrf)):
-    provided = await request.json()
-    async with LINKS_LOCK:
-        current = LINKS.get(uid)
-        if current is None:
-            raise HTTPException(status_code=404, detail="link not found")
-        updated = dict(current)
-        if payload.active is not None:
-            updated["active"] = payload.active
-        if "limit_value" in provided:
-            updated["limit_bytes"] = _limit_value_to_bytes(payload.limit_value if payload.limit_value is not None else 0, payload.limit_unit)
-            _notified_pct.pop(uid, None)
-        if payload.reset_usage:
-            updated["used_bytes"] = 0
-            _notified_pct.pop(uid, None)
-        if payload.label is not None:
-            updated["label"] = payload.label.strip()[:60] or "لینک جدید"
-        if "expires_at" in provided:
-            raw_expiry = payload.expires_at
-            if raw_expiry:
-                parsed_expiry = parse_expiry_input(raw_expiry)
-                if parsed_expiry is None:
-                    raise HTTPException(status_code=422, detail="invalid expires_at")
-                updated["expires_at"] = parsed_expiry
-            else:
-                updated["expires_at"] = None
-        if "speed_limit_value" in provided:
-            updated["speed_limit_bps"] = _speed_value_to_bps(payload.speed_limit_value if payload.speed_limit_value is not None else 0, payload.speed_limit_unit)
-        if payload.route_via is not None:
-            updated["route_via"] = payload.route_via
-        await _db_upsert_link(uid, updated)
-        LINKS[uid] = updated
-    logger.info("✏️  AUDIT link updated uid=%s fields=%s ip=%s", uid[:8], list(provided.keys()), client_ip(request))
-    asyncio.create_task(audit("link_updated", client_ip(request), f"uid={uid} fields={list(provided.keys())}"))
+        if "label" in body:
+            link["label"] = str(body["label"])[:60]
+        # ── ویرایش دستی آدرس عمومی MTProto ────────────────────────────────────
+        # برای وقتی که TCP Proxy رو خودت از داشبورد Railway ساختی و می‌خوای
+        # دامنه/پورت عمومیش رو روی یک لینک موجود ست کنی، بدون ساخت دوباره.
+        if "mtproto_public_host" in body:
+            ph = (body.get("mtproto_public_host") or "").strip()
+            link["mtproto_public_host"] = ph or None
+        if "mtproto_public_port" in body:
+            raw_pp = body.get("mtproto_public_port")
+            try:
+                link["mtproto_public_port"] = (
+                    int(raw_pp) if raw_pp not in (None, "", 0, "0") else None
+                )
+            except (TypeError, ValueError):
+                link["mtproto_public_port"] = None
+        if link.get("mtproto_public_host") and link.get("mtproto_public_port"):
+            link["mtproto_public_pending"] = False
+        if "note" in body:
+            link["note"] = str(body["note"])[:200]
+        if "reset_usage" in body and body["reset_usage"]:
+            link["used_bytes"] = 0
+            log_activity("link", f"مصرف کانفیگ «{label}» ریست شد", "info")
+        if "limit_value" in body:
+            lv = float(body.get("limit_value") or 0)
+            lu = body.get("limit_unit") or "GB"
+            link["limit_bytes"] = 0 if lv <= 0 else parse_size_to_bytes(lv, lu)
+        if "expires_days" in body:
+            ed = int(body["expires_days"] or 0)
+            link["expires_at"] = (datetime.now() + timedelta(days=ed)).isoformat() if ed > 0 else None
+        if "alpn" in body:
+            alpn_val = str(body["alpn"]).strip()[:60]
+            if alpn_val:
+                link["alpn"] = alpn_val
+        if "fingerprint" in body:
+            fp_val = str(body["fingerprint"]).strip()
+            link["fingerprint"] = fp_val if fp_val in ("chrome", "firefox", "ios") else "chrome"
+        if any(k in body for k in ("label", "note", "limit_value", "expires_days", "alpn", "fingerprint")):
+            log_activity("link", f"کانفیگ «{link['label']}» ویرایش شد", "info")
+        new_sub = body.get("sub_id", "UNCHANGED")
+        if new_sub != "UNCHANGED":
+            link["sub_id"] = new_sub or None
+
+    if new_sub != "UNCHANGED":
+        async with SUBS_LOCK:
+            if old_sub and old_sub in SUBS:
+                ids = SUBS[old_sub].get("link_ids", [])
+                if uid in ids:
+                    ids.remove(uid)
+            if new_sub and new_sub in SUBS:
+                ids = SUBS[new_sub].setdefault("link_ids", [])
+                if uid not in ids:
+                    ids.append(uid)
+
+    if mtproto_action:
+        action, snap = mtproto_action
+        if action == "stop":
+            await mtproto.stop_instance(uid)
+        else:
+            try:
+                old_port = snap.get("mtproto_port")
+                inst = await mtproto.start_instance(
+                    uid,
+                    secret=snap.get("mtproto_secret"),
+                    domain=snap.get("mtproto_domain", mtproto.DEFAULT_FAKE_TLS_DOMAIN),
+                    preferred_port=snap.get("mtproto_port"),
+                    force_port=snap.get("mtproto_manual_port", False),
+                    ad_tag=snap.get("ad_tag"),
+                )
+                async with LINKS_LOCK:
+                    if uid in LINKS:
+                        LINKS[uid]["mtproto_port"] = inst["port"]
+                        LINKS[uid]["mtproto_secret"] = inst["secret"]
+                if (snap.get("mtproto_proxy_id") and inst["port"] != old_port
+                        and not snap.get("mtproto_manual_port", False)):
+                    asyncio.create_task(_reattach_mtproto_public_proxy(
+                        uid, inst["port"], snap.get("mtproto_proxy_id"), snap.get("label", "")
+                    ))
+            except Exception as exc:
+                logger.error(f"روشن کردن MTProto ناموفق برای {uid[:8]}: {exc}")
+                async with LINKS_LOCK:
+                    if uid in LINKS:
+                        LINKS[uid]["active"] = False
+                log_activity("link", f"روشن کردن پروکسی تلگرام «{label}» ناموفق بود", "err")
+                asyncio.create_task(save_state())
+                raise HTTPException(status_code=502, detail=f"روشن کردن پروکسی تلگرام ناموفق بود: {exc}")
+
+    asyncio.create_task(save_state())
     return {"ok": True}
+    
+# ===== Endpoint جدید برای به‌روزرسانی ad_tag =====
+@app.patch("/api/links/{uid}/ad-tag")
+async def update_ad_tag(uid: str, request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    ad_tag = str(body.get("ad_tag", "")).strip()
+    if not ad_tag:
+        raise HTTPException(status_code=400, detail="ad_tag نمی‌تواند خالی باشد")
 
+    async with LINKS_LOCK:
+        if uid not in LINKS:
+            raise HTTPException(status_code=404, detail="link not found")
+        link = LINKS[uid]
+        if link.get("protocol") != "mtproto":
+            raise HTTPException(status_code=400, detail="این کانفیگ MTProto نیست")
+        link["ad_tag_status"] = "pending"   # ← جدید
+
+    asyncio.create_task(_update_mtproto_ad_tag(uid, ad_tag))
+    log_activity("link", f"درخواست به‌روزرسانی ad_tag برای «{link.get('label','')}» ثبت شد", "info")
+    return {"ok": True, "message": "ad_tag در حال اعمال است، پروکسی ری‌استارت می‌شود"}
+
+
+# اندپوینت جدید برای پول کردن وضعیت
+@app.get("/api/links/{uid}/ad-tag/status")
+async def get_ad_tag_status(uid: str, _=Depends(require_auth)):
+    async with LINKS_LOCK:
+        link = LINKS.get(uid)
+        if not link:
+            raise HTTPException(status_code=404, detail="link not found")
+        return {
+            "status": link.get("ad_tag_status", "idle"),
+            "link": link.get("ad_tag_link"),
+            "ad_tag": link.get("ad_tag"),
+        }
 
 @app.delete("/api/links/{uid}")
-async def delete_link(uid: str, request: Request, _=Depends(require_auth_csrf)):
+async def delete_link(uid: str, _=Depends(require_auth)):
     async with LINKS_LOCK:
-        removed = LINKS.get(uid)
-        if removed is None:
+        if uid not in LINKS:
             raise HTTPException(status_code=404, detail="link not found")
-        await _db_delete_link(uid)
-        LINKS.pop(uid, None)
-        token = removed.get("subscription_token")
-        if token:
-            SUBSCRIPTION_INDEX.pop(token, None)
-        _dirty_usage_uids.discard(uid)
-    _notified_pct.pop(uid, None)
-    link_hourly_traffic.pop(uid, None)
-    _rate_limiters.pop(uid, None)
-    logger.info("🗑️ AUDIT link deleted uid=%s ip=%s", uid[:8], client_ip(request))
-    asyncio.create_task(audit("link_deleted", client_ip(request), f"uid={uid}"))
-    return {"ok": True}
+        label = LINKS[uid].get("label", uid)
+        sub_id = LINKS[uid].get("sub_id")
+        proto = LINKS[uid].get("protocol")
+        proxy_id = LINKS[uid].get("mtproto_proxy_id")
+        del LINKS[uid]
+    if proto == "mtproto":
+        await mtproto.stop_instance(uid)
+        if proxy_id:
+            asyncio.create_task(bottokentcpproxy.delete_public_proxy(proxy_id))
+    if sub_id:
+        async with SUBS_LOCK:
+            if sub_id in SUBS:
+                ids = SUBS[sub_id].get("link_ids", [])
+                if uid in ids:
+                    ids.remove(uid)
+    asyncio.create_task(save_state())
+    log_activity("link", f"کانفیگ «{label}» حذف شد", "err")
+    return {"ok": True, "deleted": uid}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Node linking — inbound (این پنل صادرکننده‌ی کلید است)
+# احراز هویت این بخش با هدر X-RVG-Node-Key انجام می‌شود، نه کوکی سشن.
+# ══════════════════════════════════════════════════════════════════════════════
+def _parse_parts(raw: str | None) -> set[str]:
+    if not raw:
+        return set()
+    return {p.strip() for p in raw.split(",") if p.strip() in NODE_SHARE_PARTS}
 
 
-BulkLinkActionName = Literal["delete", "reset", "activate", "deactivate", "extend30"]
-MAX_BULK_LINK_ACTION_UIDS = 500
-
-
-class BulkLinkActionRequest(BaseModel):
-    uids: list[str] = Field(default_factory=list)
-    action: BulkLinkActionName
-
-
-@app.post("/api/links/bulk")
-async def bulk_link_action(payload: BulkLinkActionRequest, request: Request, _=Depends(require_auth_csrf)):
-    """اجرای یک عملیات روی چند لینک هم‌زمان (برای جدول لینک‌های داشبورد وقتی
-    چند ردیف تیک خورده باشند): حذف، بازنشانی مصرف، فعال/غیرفعال‌سازی، یا
-    تمدید ۳۰ روزه‌ی انقضا. به‌جای صدها درخواست PATCH/DELETE جداگانه از سمت
-    کلاینت (که هم کند است و هم لاگ حسابرسی را شلوغ می‌کند)، همه در یک درخواست
-    و یک نوشتن دسته‌ای (batched) روی SQLite انجام می‌شود."""
-    # uids تکراری را حذف کن ولی ترتیب اصلی را نگه دار (برای پیام خطا/لاگ خواناتر).
-    seen_uids: set[str] = set()
-    uids: list[str] = []
-    for u in payload.uids:
-        if isinstance(u, str) and u and u not in seen_uids:
-            seen_uids.add(u)
-            uids.append(u)
-    if not uids:
-        raise HTTPException(status_code=400, detail="هیچ لینکی انتخاب نشده")
-    if len(uids) > MAX_BULK_LINK_ACTION_UIDS:
-        raise HTTPException(status_code=400, detail=f"حداکثر {MAX_BULK_LINK_ACTION_UIDS} لینک در هر درخواست")
-
-    affected: list[str] = []
-    missing: list[str] = []
-    now = datetime.now()
-
-    async with LINKS_LOCK:
-        if payload.action == "delete":
-            to_delete = [uid for uid in uids if uid in LINKS]
-            missing = [uid for uid in uids if uid not in LINKS]
-            if to_delete:
-                await _db_bulk_delete_links(to_delete)
-                for uid in to_delete:
-                    removed = LINKS.pop(uid, None)
-                    token = (removed or {}).get("subscription_token")
-                    if token:
-                        SUBSCRIPTION_INDEX.pop(token, None)
-                    _dirty_usage_uids.discard(uid)
-                    _notified_pct.pop(uid, None)
-                    link_hourly_traffic.pop(uid, None)
-                    _rate_limiters.pop(uid, None)
-                affected = to_delete
+@app.post("/api/node/handshake")
+async def node_handshake(request: Request, key_id: str = Depends(require_node_key)):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    async with NODE_KEYS_LOCK:
+        pw_hash = (NODE_KEYS.get(key_id) or {}).get("password_hash")
+    if pw_hash:
+        given = str(body.get("password") or "")
+        if not given:
+            raise HTTPException(status_code=401, detail="PASSWORD_REQUIRED")
+        if hash_password(given) != pw_hash:
+            raise HTTPException(status_code=401, detail="PASSWORD_INVALID")
+    peer_host = str(body.get("host") or "").strip()[:120] or client_ip(request)
+    async with NODE_KEYS_LOCK:
+        entry = NODE_KEYS.get(key_id)
+        if entry is not None:
+            first_time = not entry.get("peer_host")
+            entry["peer_host"] = peer_host
+            label = entry.get("label") or key_id[:8]
         else:
-            to_write: list[tuple[str, dict]] = []
-            for uid in uids:
-                current = LINKS.get(uid)
-                if current is None:
-                    missing.append(uid)
-                    continue
-                updated = dict(current)
-                if payload.action == "reset":
-                    updated["used_bytes"] = 0
-                    _notified_pct.pop(uid, None)
-                elif payload.action == "activate":
-                    updated["active"] = True
-                elif payload.action == "deactivate":
-                    updated["active"] = False
-                elif payload.action == "extend30":
-                    base = now
-                    current_exp = updated.get("expires_at")
-                    if current_exp:
-                        try:
-                            parsed = datetime.fromisoformat(current_exp)
-                            if parsed > base:
-                                base = parsed
-                        except ValueError:
-                            pass
-                    updated["expires_at"] = (base + timedelta(days=30)).isoformat()
-                to_write.append((uid, updated))
-            if to_write:
-                await _db_bulk_upsert_links(to_write)
-                for uid, updated in to_write:
-                    LINKS[uid] = updated
-                affected = [uid for uid, _ in to_write]
-
-    logger.info(
-        "🧰 AUDIT links bulk action=%s affected=%d missing=%d ip=%s",
-        payload.action, len(affected), len(missing), client_ip(request),
-    )
-    asyncio.create_task(audit("links_bulk_action", client_ip(request), f"action={payload.action} affected={len(affected)}"))
-    return {"ok": True, "affected": len(affected), "missing": missing}
-
-
-# ───────────────────────── Backup / Restore (manual) ─────────────────────────
-# مکمل پرسیستنسِ خودکار SQLite: یک فایل JSON قابل‌دانلود که می‌توانید جدا از
-# سرور نگه دارید (مثلاً قبل از یک تغییر بزرگ، یا برای انتقال به یک دیپلوی
-# دیگر). شامل هش رمز عبور هم هست تا بازیابی، وضعیت را کامل برگرداند —
-# پس با فایل بکاپ مثل یک رمز عبور رفتار کنید و آن را جای امنی نگه دارید.
-
-BACKUP_VERSION = 3
-ENCRYPTED_BACKUP_PREFIX = b"VORTEX-ENCRYPTED-BACKUP-V1\\n"
-
-def _backup_cipher() -> Fernet:
-    key = CONFIG["backup_encryption_key"]
-    if not key:
-        raise RuntimeError("BACKUP_ENCRYPTION_KEY is required for encrypted backups")
-    try:
-        return Fernet(key.encode())
-    except Exception as exc:
-        raise RuntimeError("BACKUP_ENCRYPTION_KEY is not a valid Fernet key") from exc
-
-def _encrypt_backup(payload: dict) -> bytes:
-    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
-    return ENCRYPTED_BACKUP_PREFIX + _backup_cipher().encrypt(raw)
-
-def _decrypt_backup(raw: bytes) -> dict:
-    if not raw.startswith(ENCRYPTED_BACKUP_PREFIX):
-        if not CONFIG["allow_plaintext_backup"]:
-            raise HTTPException(status_code=400, detail="plain backup disabled; use an encrypted backup")
-        try:
-            return json.loads(raw)
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="invalid backup JSON")
-    try:
-        decoded = _backup_cipher().decrypt(raw[len(ENCRYPTED_BACKUP_PREFIX):])
-        return json.loads(decoded)
-    except (InvalidToken, ValueError, TypeError, RuntimeError):
-        raise HTTPException(status_code=400, detail="backup decryption failed")
-
-@app.get("/api/backup")
-async def export_backup(_=Depends(require_auth)):
+            first_time, label = False, key_id[:8]
+    if first_time:
+        log_activity("node", f"پنل «{peer_host}» با کلید «{label}» متصل شد", "ok")
     async with LINKS_LOCK:
-        links_snapshot = {uid: dict(data) for uid, data in LINKS.items()}
-    backup = {
-        "version": BACKUP_VERSION,
-        "app": APP_NAME,
-        "exported_at": datetime.now().isoformat(),
-        "password_hash": AUTH["password_hash"],
-        "links": links_snapshot,
+        links_count = len(LINKS)
+    async with SUBS_LOCK:
+        subs_count = len(SUBS)
+    return {
+        "ok": True,
+        "host": get_host(),
+        "version": get_current_version(),
+        "links_count": links_count,
+        "subs_count": subs_count,
     }
-    if not CONFIG["backup_encryption_key"]:
-        raise HTTPException(status_code=503, detail="encrypted backups are not configured")
-    content = _encrypt_backup(backup)
-    filename = f"vortex-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.vortex"
-    return Response(content=content, media_type="application/octet-stream",
-                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
-def _validate_password_hash_format(value) -> bool:
-    if not isinstance(value, str) or len(value) > 512:
-        return False
-    if value.startswith("$argon2id$"):
-        try:
-            PASSWORD_HASHER.check_needs_rehash(value)
-            # Parse/validate the encoded parameters without verifying a password.
-            from argon2 import extract_parameters
-            extract_parameters(value)
-            return True
-        except Exception:
-            return False
-    if "$" not in value:
-        return False
-    salt_hex, _, hash_hex = value.partition("$")
-    if len(salt_hex) != 32 or len(hash_hex) != 64:
-        return False
-    try:
-        bytes.fromhex(salt_hex)
-        bytes.fromhex(hash_hex)
-    except ValueError:
-        return False
-    return True
 
-
-@app.post("/api/backup/restore")
-async def restore_backup(request: Request, _=Depends(require_auth_csrf)):
-    content_length = request.headers.get("content-length")
-    max_backup_bytes = 2 * 1024 * 1024
-    if content_length and content_length.isdigit() and int(content_length) > max_backup_bytes:
-        raise HTTPException(status_code=413, detail="backup too large")
-    raw = await request.body()
-    if len(raw) > max_backup_bytes:
-        raise HTTPException(status_code=413, detail="backup too large")
-    body = _decrypt_backup(raw)
-    if not isinstance(body, dict) or body.get("version") not in (1, 2, BACKUP_VERSION):
-        raise HTTPException(status_code=400, detail="نسخه‌ی بکاپ پشتیبانی نمی‌شود")
-
-    links_data = body.get("links")
-    if not isinstance(links_data, dict) or not links_data or len(links_data) > 10000:
-        raise HTTPException(status_code=400, detail="بخش links نامعتبر یا بیش از حد بزرگ است")
-
-    new_links = {}
-    seen_subscription_tokens = set()
-    for uid, data in links_data.items():
-        if not isinstance(uid, str) or not isinstance(data, dict):
-            raise HTTPException(status_code=400, detail="رکورد لینک نامعتبر است")
-        try:
-            normalized_uid = str(uuidlib.UUID(uid))
-            if normalized_uid != uid.lower():
-                raise ValueError("uuid format")
-            limit_bytes = int(data.get("limit_bytes", 0))
-            used_bytes = int(data.get("used_bytes", 0))
-            speed_bps = int(data.get("speed_limit_bps", 0) or 0)
-            subscription_token = str(data.get("subscription_token") or "").strip()
-            if subscription_token and not (32 <= len(subscription_token) <= 256):
-                raise ValueError("invalid subscription token length")
-            if not subscription_token:
-                subscription_token = secrets.token_urlsafe(32)
-            if subscription_token in seen_subscription_tokens:
-                raise ValueError("duplicate subscription token")
-            seen_subscription_tokens.add(subscription_token)
-            if limit_bytes < 0 or used_bytes < 0 or speed_bps < 0:
-                raise ValueError("negative value")
-            if limit_bytes and used_bytes > limit_bytes:
-                raise ValueError("usage exceeds limit")
-            label = str(data.get("label", "لینک")).strip()[:60]
-            if not label:
-                label = "لینک"
-            created_at = str(data.get("created_at") or datetime.now().isoformat())
-            datetime.fromisoformat(created_at)
-            expires_at = data.get("expires_at")
-            if expires_at is not None:
-                if not isinstance(expires_at, str):
-                    raise ValueError("invalid expiry")
-                datetime.fromisoformat(expires_at)
-            new_links[normalized_uid] = {
-                "label": label, "limit_bytes": limit_bytes, "used_bytes": used_bytes,
-                "created_at": created_at, "active": bool(data.get("active", True)),
-                "expires_at": expires_at, "speed_limit_bps": speed_bps,
-                "subscription_token": subscription_token,
-            }
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail=f"رکورد لینک {uid!r} نامعتبر است")
-
-    candidate = body.get("password_hash")
-    if candidate is not None and not _validate_password_hash_format(candidate):
-        raise HTTPException(status_code=400, detail="فرمت رمز عبور در فایل بکاپ نامعتبر است")
-
-    # مهم: هیچ تغییر حافظه‌ای قبل از commit موفق DB انجام نمی‌شود.
-    current_token = request.cookies.get(SESSION_COOKIE)
-    async with LINKS_LOCK:
-        async with DB_LOCK:
-            await asyncio.to_thread(_db_restore_sync, new_links, candidate)
-        LINKS.clear()
-        LINKS.update(new_links)
-        SUBSCRIPTION_INDEX.clear()
-        for restored_uid, restored_data in new_links.items():
-            token = restored_data.get("subscription_token")
-            if token:
-                SUBSCRIPTION_INDEX[token] = restored_uid
-        _dirty_usage_uids.clear()
-
-    restored_password = candidate is not None
-    if restored_password:
-        AUTH["password_hash"] = candidate
-        # باگ واقعی: این بخش قبلاً فقط دیکشنری درون‌حافظه‌ای SESSIONS را
-        # پاک می‌کرد. وقتی Redis پیکربندی شده باشد (چند instance)، سشن‌ها
-        # واقعاً در Redis نگه‌داری می‌شوند (is_valid_session/create_session
-        # وقتی redis_client ست باشد اصلاً به SESSIONS نگاه نمی‌کنند)، پس
-        # بازیابیِ بکاپ همراه با رمز عبور جدید هیچ سشن فعالی را باطل
-        # نمی‌کرد — دقیقاً همان تهدیدی که این پاک‌سازی قرار بود جلویش را
-        # بگیرد (مثلاً یک سشن لو رفته که ادمین با تغییر/بازیابی رمز عبور
-        # می‌خواهد باطلش کند). همان منطقِ api_change_password اینجا هم
-        # اعمال می‌شود تا هر دو مسیر سازگار و امن باشند.
-        if redis_client is not None:
-            keys = []
-            async for key in redis_client.scan_iter(match="vortex:session:*", count=100):
-                keys.append(key)
-            if keys:
-                await redis_client.delete(*keys)
-            if current_token:
-                await redis_client.setex(f"vortex:session:{current_token}", SESSION_TTL, "1")
-        else:
-            async with SESSIONS_LOCK:
-                SESSIONS.clear()
-                if current_token:
-                    SESSIONS[current_token] = time.time() + SESSION_TTL
-
-    _notified_pct.clear()
-    link_hourly_traffic.clear()
-    _rate_limiters.clear()
-    asyncio.create_task(audit("backup_restore", client_ip(request), f"links={len(new_links)} password_restored={restored_password}"))
-    logger.info("♻️ AUDIT backup restored: %d links, password_restored=%s, ip=%s", len(new_links), restored_password, client_ip(request))
-    return {"ok": True, "restored_links": len(new_links), "restored_password": restored_password}
-
-
-# ───────────────────────── VLESS relay ─────────────────────────
-
-RELAY_BUF = 64 * 1024
-
-
-class VlessHeaderIncomplete(ValueError):
-    """VLESS header is valid so far, but more bytes are required."""
-
-
-def _need(chunk: bytes, pos: int, n: int, what: str):
-    """بررسی می‌کند که n بایت بعد از pos واقعاً در chunk موجود باشد.
-
-    کمبود داده یک خطای «موقت» است، نه malformed packet: در WebSocket ممکن
-    است بعضی کلاینت‌ها هدر اولیه‌ی VLESS را در بیش از یک message تحویل دهند.
-    این تمایز اجازه می‌دهد caller تا کامل شدن هدر صبر کند، بدون این‌که packet
-    واقعاً خراب با سکوت پذیرفته شود.
-    """
-    if pos + n > len(chunk):
-        raise VlessHeaderIncomplete(f"incomplete VLESS header: need {n} more bytes for {what}")
-
-
-async def parse_vless_header(chunk: bytes, expected_uuid: str | None = None):
-    if len(chunk) < 24:
-        raise VlessHeaderIncomplete("incomplete VLESS header: need at least 24 bytes")
-    if chunk[0] != 0:
-        raise ValueError("unsupported VLESS version")
-    header_uuid = str(uuidlib.UUID(bytes=chunk[1:17]))
-    if expected_uuid is not None:
-        try:
-            expected_uuid_norm = str(uuidlib.UUID(expected_uuid))
-        except ValueError:
-            raise ValueError("invalid link uuid")
-        if not hmac.compare_digest(header_uuid, expected_uuid_norm):
-            raise ValueError("VLESS UUID does not match tunnel path")
-    pos = 17
-
-    _need(chunk, pos, 1, "addon length")
-    addon_len = chunk[pos]
-    pos += 1
-    _need(chunk, pos, addon_len, "addons")
-    pos += addon_len
-    _need(chunk, pos, 1, "command")
-    command = chunk[pos]
-    pos += 1
-    if command not in (1, 2):
-        raise ValueError(f"unsupported VLESS command: {command}")
-
-    _need(chunk, pos, 2, "port")
-    port = int.from_bytes(chunk[pos:pos + 2], "big")
-    pos += 2
-    if port == 0:
-        raise ValueError("invalid destination port")
-    vless_allowed_ports = CONFIG.get("vless_allowed_ports", set())
-    if vless_allowed_ports and port not in vless_allowed_ports:
-        raise ValueError(f"VLESS destination port is not allowed: {port}")
-    if len(chunk) > CONFIG["max_ws_initial_bytes"]:
-        raise ValueError("initial VLESS frame too large")
-
-    _need(chunk, pos, 1, "address type")
-    addr_type = chunk[pos]
-    pos += 1
-
-    if addr_type == 1:
-        _need(chunk, pos, 4, "IPv4 address")
-        address = ".".join(str(b) for b in chunk[pos:pos + 4])
-        pos += 4
-    elif addr_type == 2:
-        _need(chunk, pos, 1, "domain length")
-        dlen = chunk[pos]
-        pos += 1
-        if dlen == 0 or dlen > 253:
-            raise ValueError("invalid domain length")
-        _need(chunk, pos, dlen, "domain name")
-        raw_domain = chunk[pos:pos + dlen].decode("utf-8", errors="strict").strip().rstrip(".")
-        try:
-            address = raw_domain.encode("idna").decode("ascii")
-        except UnicodeError:
-            raise ValueError("invalid domain name")
-        if not address or any(ord(c) < 32 or ord(c) == 127 for c in address):
-            raise ValueError("invalid domain name")
-        pos += dlen
-    elif addr_type == 3:
-        _need(chunk, pos, 16, "IPv6 address")
-        raw = chunk[pos:pos + 16]
-        address = ":".join(f"{raw[i]:02x}{raw[i+1]:02x}" for i in range(0, 16, 2))
-        pos += 16
-    else:
-        raise ValueError(f"unknown address type: {addr_type}")
-
-    if not address:
-        raise ValueError("empty destination address")
-    return address, port, chunk[pos:], command
-
-
-async def receive_vless_initial(websocket: WebSocket, expected_uuid: str, max_bytes: int, timeout: float = 15.0):
-    """Receive enough WebSocket data to parse a complete VLESS request header.
-
-    Some clients deliver the first VLESS request as multiple WebSocket messages.
-    The previous implementation tried to parse only the first message, which
-    turned a perfectly valid fragmented request into ValueError and immediately
-    closed the tunnel. We buffer only the bounded initial request header/payload,
-    then hand all bytes after the VLESS header to the normal upstream path.
-    """
-    buffer = bytearray()
-    deadline = asyncio.get_running_loop().time() + timeout
-
-    while True:
-        remaining = deadline - asyncio.get_running_loop().time()
-        if remaining <= 0:
-            raise TimeoutError("timed out waiting for complete VLESS header")
-
-        msg = await asyncio.wait_for(websocket.receive(), timeout=remaining)
-        if msg.get("type") == "websocket.disconnect":
-            raise WebSocketDisconnect(code=1000)
-
-        data = msg.get("bytes")
-        if data is None and msg.get("text"):
-            data = msg["text"].encode()
-        if not data:
-            continue
-
-        if len(buffer) + len(data) > max_bytes:
-            raise ValueError("initial VLESS request too large")
-        buffer.extend(data)
-
-        try:
-            return await parse_vless_header(bytes(buffer), expected_uuid=expected_uuid)
-        except VlessHeaderIncomplete:
-            continue
-
-
-async def check_quota(uid: str, extra: int) -> bool:
-    async with LINKS_LOCK:
-        link = LINKS.get(uid)
-        if link is None:
-            # لینک ناشناس/حذف‌شده مطلقاً نباید اجازه‌ی عبور بگیرد — این خط
-            # همان چیزی است که کل مکانیزم لینک/سهمیه را معنا می‌دهد.
-            return False
-        if not link["active"]:
-            return False
-        if is_link_expired(link):
-            return False
-        if link["limit_bytes"] == 0:
-            return True
-        return (link["used_bytes"] + extra) <= link["limit_bytes"]
-
-
-async def reserve_usage(uid: str, n: int) -> tuple[bool, int]:
-    """چک کردن سهمیه (و انقضا) و ثبت مصرف را در یک قفل واحد انجام می‌دهد.
-
-    قبلاً check_quota و add_usage دو قفل جدا می‌گرفتند؛ بین این دو، چند
-    chunk هم‌زمان می‌توانستند همه از یک quota باقی‌مانده‌ی یکسان عبور کنند
-    و در مجموع کمی بیشتر از سقف مصرف ثبت شود (race). با یک قفل واحد این
-    مشکل برطرف می‌شود.
-
-    خروجی (ok, speed_limit_bps) است؛ speed_limit_bps را فراخوان برای
-    throttle کردن ارسال همان chunk استفاده می‌کند (بدون نیاز به یک lookup
-    جداگانه‌ی LINKS).
-    """
-    async with LINKS_LOCK:
-        link = LINKS.get(uid)
-        if link is None or not link["active"]:
-            return False, 0
-        if is_link_expired(link):
-            return False, 0
-        if link["limit_bytes"] != 0 and (link["used_bytes"] + n) > link["limit_bytes"]:
-            return False, 0
-        link["used_bytes"] += n
-        _dirty_usage_uids.add(uid)  # به‌جای نوشتن فوری روی دیسک، فقط علامت می‌زنیم؛ _periodic_usage_flush آن را دوره‌ای ذخیره می‌کند
-        speed_limit_bps = link.get("speed_limit_bps", 0)
-        pct = (link["used_bytes"] / link["limit_bytes"] * 100) if link["limit_bytes"] else None
-        label = link["label"]
-    # چک/ارسال اعلان تلگرام عمداً بیرون از LINKS_LOCK انجام می‌شود تا مسیر
-    # داغِ رله‌ی داده هرگز منتظر یک درخواست شبکه‌ای (تلگرام) نماند.
-    if pct is not None:
-        _maybe_schedule_quota_alert(uid, label, pct)
-    return True, speed_limit_bps
-
-
-def _track(uid: str, conn_id: str, size: int):
-    stats["total_bytes"] += size
-    stats["total_requests"] += 1
-    connections[conn_id]["bytes"] += size
-    hour_key = datetime.now().strftime("%H:00")
-    hourly_traffic[hour_key] += size
-    link_hourly_traffic[uid][hour_key] += size
-
-
-async def upstream_to_client(ws: WebSocket, writer: asyncio.StreamWriter, conn_id: str, link_uid: str):
-    try:
-        while True:
-            msg = await ws.receive()
-            if msg["type"] == "websocket.disconnect":
-                break
-            data = msg.get("bytes") or (msg.get("text", "").encode() if msg.get("text") else None)
-            if not data:
-                continue
-            ok, speed_limit_bps = await reserve_usage(link_uid, len(data))
-            if not ok:
-                await ws.close(code=1008, reason="quota exceeded")
-                break
-            _track(link_uid, conn_id, len(data))
-            await throttle(link_uid, speed_limit_bps, len(data))
-            writer.write(data)
-            await writer.drain()
-    except WebSocketDisconnect:
-        pass
-    finally:
-        try:
-            writer.write_eof()
-        except Exception:
-            pass
-
-
-async def downstream_to_client(ws: WebSocket, reader: asyncio.StreamReader, conn_id: str, link_uid: str):
-    first = True
-    try:
-        while True:
-            data = await reader.read(RELAY_BUF)
-            if not data:
-                break
-            ok, speed_limit_bps = await reserve_usage(link_uid, len(data))
-            if not ok:
-                await ws.close(code=1008, reason="quota exceeded")
-                break
-            _track(link_uid, conn_id, len(data))
-            await throttle(link_uid, speed_limit_bps, len(data))
-            await ws.send_bytes((b"\x00\x00" + data) if first else data)
-            first = False
-    except Exception:
-        pass
-
-
-
-class _UdpRelayProtocol(asyncio.DatagramProtocol):
-    """Receives UDP datagrams back from the destination and queues them for
-    relay to the WebSocket client. Kept intentionally dumb (no parsing) —
-    ordering/loss semantics of UDP are preserved as-is."""
-
-    def __init__(self, queue: "asyncio.Queue[bytes]"):
-        self.queue = queue
-        self.transport: asyncio.DatagramTransport | None = None
-
-    def connection_made(self, transport: asyncio.BaseTransport) -> None:
-        self.transport = transport  # type: ignore[assignment]
-
-    def datagram_received(self, data: bytes, addr) -> None:
-        try:
-            self.queue.put_nowait(data)
-        except asyncio.QueueFull:
-            pass  # UDP is loss-tolerant; drop under backpressure rather than block
-
-    def error_received(self, exc: Exception) -> None:
-        logger.warning("udp relay socket error: %s", exc)
-
-
-async def upstream_udp_to_target(
-    ws: WebSocket, transport: asyncio.DatagramTransport, conn_id: str, link_uid: str, initial: bytes,
-):
-    """Reads VLESS-framed UDP packets (2-byte big-endian length + payload,
-    possibly several per WebSocket message, possibly split across messages)
-    and forwards each individual datagram to the UDP destination."""
-    buffer = bytearray(initial)
-    try:
-        while True:
-            while len(buffer) >= 2:
-                plen = int.from_bytes(buffer[:2], "big")
-                if len(buffer) < 2 + plen:
-                    break
-                packet = bytes(buffer[2:2 + plen])
-                del buffer[:2 + plen]
-                if packet:
-                    ok, speed_limit_bps = await reserve_usage(link_uid, len(packet))
-                    if not ok:
-                        await ws.close(code=1008, reason="quota exceeded")
-                        return
-                    _track(link_uid, conn_id, len(packet))
-                    await throttle(link_uid, speed_limit_bps, len(packet))
-                    transport.sendto(packet)
-            msg = await ws.receive()
-            if msg["type"] == "websocket.disconnect":
-                break
-            data = msg.get("bytes") or (msg.get("text", "").encode() if msg.get("text") else None)
-            if not data:
-                continue
-            if len(buffer) + len(data) > CONFIG["max_ws_initial_bytes"] * 4:
-                # Sanity bound: a client that never sends complete length-prefixed
-                # frames must not be allowed to grow this buffer unboundedly.
-                raise ValueError("udp relay buffer overflow")
-            buffer.extend(data)
-    except WebSocketDisconnect:
-        pass
-
-
-async def downstream_udp_to_client(ws: WebSocket, queue: "asyncio.Queue[bytes]", conn_id: str, link_uid: str):
-    """Wraps each UDP response datagram with the VLESS length-prefix framing
-    and relays it to the client, prefixing the VLESS response header (2 zero
-    bytes: version + empty addons) onto the very first frame, matching the
-    TCP path in downstream_to_client."""
-    first = True
-    try:
-        while True:
-            data = await queue.get()
-            ok, speed_limit_bps = await reserve_usage(link_uid, len(data))
-            if not ok:
-                await ws.close(code=1008, reason="quota exceeded")
-                break
-            _track(link_uid, conn_id, len(data))
-            await throttle(link_uid, speed_limit_bps, len(data))
-            framed = len(data).to_bytes(2, "big") + data
-            if first:
-                framed = b"\x00\x00" + framed
-                first = False
-            await ws.send_bytes(framed)
-    except Exception:
-        pass
-
-
-async def try_acquire_ip_slot(ip: str) -> bool:
-    async with CONNECTIONS_LOCK:
-        if connections_by_ip.get(ip, 0) >= CONFIG["max_connections_per_ip"]:
-            return False
-        connections_by_ip[ip] += 1
-        return True
-
-async def release_ip_slot(ip: str) -> None:
-    async with CONNECTIONS_LOCK:
-        current = connections_by_ip.get(ip, 0)
-        if current <= 1:
-            connections_by_ip.pop(ip, None)
-        else:
-            connections_by_ip[ip] = current - 1
-
-def _allowed_origins(request_host_header: str | None = None) -> set[str]:
-    """Compute the set of Origins allowed to talk to this gateway's panel/API/tunnel.
-
-    باگ واقعی که اینجا پیدا شد: این لیست قبلاً فقط از روی RAILWAY_PUBLIC_DOMAIN
-    ساخته می‌شد. اگر آن متغیر محیطی روی سرویس Railway تنظیم نشده باشد (یک
-    اشتباه رایج: ساختن دامنه‌ی عمومی از Settings → Networking به‌خودی‌خود آن
-    را به‌عنوان env var داخل کانتینر تزریق نمی‌کند)، get_host() به "localhost"
-    سقوط می‌کرد و این لیست عملاً به {"http://localhost:8000"} محدود می‌شد.
-    نتیجه: هر اتصال واقعی (وب‌سوکت یا CORS) که هدر Origin بفرستد — صفحه‌ی
-    تست /test-ws در مرورگر، درخواست‌های AJAX پنل، یا برخی کلاینت‌های VLESS —
-    با 1008/403 رد می‌شد؛ دقیقاً وقتی مستقیم به دامنه‌ی Railway وصل می‌شدی،
-    نه وقتی از طریق Cloudflare Worker Relay (که ORIGIN را در زمان دیپلوی از
-    هدر Host همان درخواست تشخیص می‌دهد، نه از این متغیر محیطی).
-
-    برای اینکه این چک اصلاً به تنظیم دستیِ RAILWAY_PUBLIC_DOMAIN وابسته
-    نباشد، هاست واقعیِ همین درخواست هم همیشه به‌عنوان مبدأ مجاز اضافه
-    می‌شود — هم به‌صورت خودکار در get_host() (از طریق _note_request_host)
-    و هم مستقیماً اینجا، تا حتی پیش از اولین بار "یادگرفتن" هاست هم درست
-    کار کند.
-    """
-    allowed = {get_public_origin(), "http://localhost:8000"}
-    parts = _worker_endpoint_parts()
-    if parts:
-        endpoint_host, _gate_path = parts
-        worker_url = ACTIVE_WORKER_URL.strip().rstrip("/")
-        parsed = urlparse(worker_url)
-        if parsed.scheme and parsed.netloc:
-            allowed.add(f"{parsed.scheme}://{parsed.netloc}")
-    header_host = (request_host_header or "").strip()
-    if header_host:
-        allowed.add(f"https://{header_host}")
-        allowed.add(f"http://{header_host}")
-    return allowed
-
-
-def _allowed_websocket_origins(websocket: WebSocket | None = None) -> set[str]:
-    header_host = websocket.headers.get("host") if websocket is not None else None
-    return _allowed_origins(header_host)
-
-
-def websocket_client_ip(websocket: WebSocket) -> str:
-    # نکته‌ی امنیتی (باگ واقعی که در این بازبینی پیدا شد): این تابع قبلاً
-    # ساده‌ترین مقدار X-Forwarded-For یعنی سمت چپ‌ترین (parts[0]) را
-    # به‌عنوان IP واقعی کلاینت می‌پذیرفت. آن مقدار توسط خودِ کلاینت قابل
-    # جعل است (کلاینت هر مقداری برای X-Forwarded-For بفرستد، پراکسی مورد
-    # اعتماد معمولاً آن را دست‌نخورده جلو می‌فرستد و فقط IP خودش را به
-    # انتهای زنجیره اضافه می‌کند). یعنی یک کلاینت می‌توانست با تغییر همین
-    # هدر، سقف «حداکثر اتصال هم‌زمان به‌ازای هر IP» (MAX_CONNECTIONS_PER_IP)
-    # را کاملاً دور بزند و هم‌چنین آدرس نادرستی در آدیت‌لاگ ثبت شود.
-    #
-    # همان منطقِ درستِ client_ip() (بالا) اینجا هم پیاده می‌شود: از
-    # راست‌ترین مقدار زنجیره شروع می‌کنیم و تا وقتی هاپ‌ها در محدوده‌ی
-    # پراکسی‌های مورد اعتماد هستند جلو می‌رویم؛ اولین هاپِ غیرمورداعتماد،
-    # IP واقعی کلاینت است.
-    peer = websocket.client.host if websocket.client else "unknown"
-    if not CONFIG["trust_proxy"] or not TRUSTED_PROXY_NETWORKS:
-        return peer
-    try:
-        peer_addr = ipaddress.ip_address(peer)
-    except ValueError:
-        return peer
-    if not any(peer_addr in network for network in TRUSTED_PROXY_NETWORKS):
-        return peer
-    forwarded = websocket.headers.get("x-forwarded-for", "")
-    values = [p.strip() for p in forwarded.split(",") if p.strip()]
-    values.append(peer)
-    for value in reversed(values):
-        try:
-            ip = ipaddress.ip_address(value)
-        except ValueError:
-            continue
-        if not any(ip in net for net in TRUSTED_PROXY_NETWORKS):
-            return str(ip)
+@app.get("/api/node/snapshot")
+async def node_snapshot(request: Request, _key_id: str = Depends(require_node_key)):
+    """فقط بخش‌هایی که هم درخواست شده و هم برای این کلید مجاز است برگردانده می‌شود."""
+    parts = _parse_parts(request.query_params.get("parts"))
+    async with NODE_KEYS_LOCK:
+        entry = NODE_KEYS.get(_key_id) or {}
+        allowed = {p for p in NODE_SHARE_PARTS if (entry.get("share") or {}).get(p, p != "logs")}
+    parts &= allowed
+    out: dict = {"host": get_host(), "version": get_current_version(), "parts": sorted(parts)}
+    if "links" in parts:
+        out["links"] = (await list_links(None))["links"]
+    if "subs" in parts:
+        out["subs"] = (await list_subs(None))["subs"]
+    if "logs" in parts:
+        out["logs"] = (await get_activity(None))["logs"][-60:]
+    if parts & {"usage", "requests"}:
+        s = await get_stats(None)
+        stats_out = {
+            "uptime": s["uptime"],
+            "links_count": s["links_count"],
+            "active_links": s["active_links"],
+            "subs_count": s["subs_count"],
+        }
+        if "usage" in parts:
+            stats_out["total_bytes"] = stats["total_bytes"]
+            stats_out["total_traffic_mb"] = s["total_traffic_mb"]
+            stats_out["hourly"] = s["hourly"]
+            stats_out["active_connections"] = s["active_connections"]
+        if "requests" in parts:
+            stats_out["total_requests"] = s["total_requests"]
+            stats_out["total_errors"] = s["total_errors"]
+        out["stats"] = stats_out
+    return out
+
+
+async def _require_node_manage(key_id: str) -> str:
+    async with NODE_KEYS_LOCK:
+        entry = NODE_KEYS.get(key_id) or {}
+        peer = entry.get("peer_host") or "نود"
+        allowed = bool(entry.get("can_manage", False))
+    if not allowed:
+        raise HTTPException(status_code=403, detail="این کلید اجازه‌ی ویرایش/حذف کانفیگ را ندارد")
     return peer
 
 
-def _tune_socket(writer: asyncio.StreamWriter) -> None:
-    """TCP_NODELAY + بافر بزرگ‌تر روی سوکت خروجی به مقصد.
+@app.patch("/api/node/links/{uid}")
+async def node_update_link(uid: str, request: Request, key_id: str = Depends(require_node_key)):
+    peer = await _require_node_manage(key_id)
+    result = await update_link(uid, request, None)
+    log_activity("node", f"کانفیگ {uid[:8]} از راه دور توسط «{peer}» ویرایش شد", "warn")
+    return result
 
-    باگ واقعی که اینجا پیدا شد: سوکت خروجی هیچ tuning ای نداشت، یعنی
-    الگوریتم Nagle روی آن فعال می‌ماند. برای بسته‌های کوچک و پشت‌سرهم
-    (مثل ClientHello تی‌ال‌اس یا چانک‌های اولیه‌ی VLESS) این باعث تأخیر
-    قابل توجه (Nagle + Delayed-ACK) می‌شود که روی زیرساخت شبکه‌ی Railway
-    به اندازه‌ای کش پیدا می‌کند که کلاینت یا خودِ شبکه کانکشن را به‌عنوان
-    بی‌فعالیت ببندد — دقیقاً همان الگوی «چند ثانیه وصل، بعد پینگ -۱».
-    """
+
+@app.delete("/api/node/links/{uid}")
+async def node_delete_link(uid: str, key_id: str = Depends(require_node_key)):
+    peer = await _require_node_manage(key_id)
+    result = await delete_link(uid, None)
+    log_activity("node", f"کانفیگ {uid[:8]} از راه دور توسط «{peer}» حذف شد", "err")
+    return result
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Node linking — outbound (این پنل به نودهای دیگر وصل می‌شود)
+# ══════════════════════════════════════════════════════════════════════════════
+@app.get("/api/nodes/keys")
+async def list_node_keys(_=Depends(require_auth)):
+    host = get_host()
+    async with NODE_KEYS_LOCK:
+        snap = dict(NODE_KEYS)
+    out = []
+    for key_id, e in snap.items():
+        out.append({
+            "key_id": key_id,
+            "label": e.get("label", ""),
+            "key": build_node_key(e.get("issued_host") or host, e.get("secret", "")),
+            "created_at": e.get("created_at"),
+            "revoked": bool(e.get("revoked")),
+            "share": {p: bool((e.get("share") or {}).get(p, p != "logs")) for p in NODE_SHARE_PARTS},
+            "can_manage": bool(e.get("can_manage", False)),
+            "has_password": e.get("password_hash") is not None,
+            "last_used_at": e.get("last_used_at"),
+            "peer_host": e.get("peer_host"),
+            "use_count": int(e.get("use_count", 0)),
+        })
+    out.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+    return {"keys": out, "host": host}
+
+
+def _node_key_share(body_share) -> dict:
+    """دسترسی‌های خواندن هر کلید؛ پیش‌فرض مثل خروجی نود: همه فعال جز لاگ‌ها."""
+    src = body_share if isinstance(body_share, dict) else {}
+    return {p: bool(src.get(p, p != "logs")) for p in NODE_SHARE_PARTS}
+
+
+@app.post("/api/nodes/keys")
+async def create_node_key(request: Request, _=Depends(require_auth)):
     try:
-        sock = writer.get_extra_info("socket")
-        if sock is not None:
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
-    except Exception as exc:
-        logger.warning("tune_socket failed: %s", exc)
+        body = await request.json()
+    except Exception:
+        body = {}
+    label = (str(body.get("label") or "").strip() or f"کلید {len(NODE_KEYS) + 1}")[:60]
+    share = _node_key_share(body.get("share"))
+    can_manage = bool(body.get("can_manage", False))
+    password = str(body.get("password") or "").strip()
+    host = get_host()
+    key_id = generate_uuid()
+    secret = secrets.token_urlsafe(24)
+    async with NODE_KEYS_LOCK:
+        NODE_KEYS[key_id] = {
+            "label": label,
+            "secret": secret,
+            "issued_host": host,
+            "created_at": datetime.now().isoformat(),
+            "revoked": False,
+            "share": share,
+            "can_manage": can_manage,
+            "password_hash": hash_password(password) if password else None,
+            "last_used_at": None,
+            "peer_host": None,
+            "use_count": 0,
+        }
+    asyncio.create_task(save_state())
+    log_activity("node", f"کلید نود «{label}» ساخته شد", "ok")
+    return {
+        "ok": True, "key_id": key_id, "label": label,
+        "key": build_node_key(host, secret), "share": share, "can_manage": can_manage,
+    }
 
 
-@app.websocket("/tunnel/{uid}")
-async def websocket_tunnel_tunnel_path(websocket: WebSocket, uid: str):
-    return await _websocket_tunnel_impl(websocket, uid)
-
-
-@app.websocket("/ws/{uid}")
-async def websocket_tunnel_ws_path(websocket: WebSocket, uid: str):
-    return await _websocket_tunnel_impl(websocket, uid)
-
-
-async def _websocket_tunnel_impl(websocket: WebSocket, uid: str):
-    _note_request_host(websocket.headers.get("host"))
-    origin = websocket.headers.get("origin")
-    allowed_origins = _allowed_websocket_origins(websocket)
-    if origin and origin not in allowed_origins:
-        await websocket.close(code=1008, reason="origin not allowed")
-        return
-    peer_ip = websocket_client_ip(websocket)
-    if not await try_acquire_ip_slot(peer_ip):
-        await websocket.close(code=1008, reason="too many connections from client")
-        return
-    await websocket.accept()
-
-    # سقف تعداد اتصال هم‌زمان (کلی و به‌ازای هر لینک) — قبل از ثبت در
-    # connections بررسی می‌شود تا یک لینک نتواند با باز کردن اتصال‌های
-    # بی‌شمار سرور را از منابع خالی کند.
-    if not await try_acquire_connection_slot(uid):
-        await websocket.close(code=1008, reason="too many concurrent connections")
-        await release_ip_slot(peer_ip)
-        return
-
-    conn_id = secrets.token_urlsafe(8)
-    connections[conn_id] = {"uuid": uid, "connected_at": datetime.now().isoformat(), "bytes": 0}
-    logger.info("✅ tunnel open [%s] link=%s active=%d", conn_id, uid[:8], len(connections))
-    current_task = asyncio.current_task()
-    if current_task is not None:
-        RELAY_TASKS.add(current_task)
-    writer = None
-    udp_transport = None
+@app.patch("/api/nodes/keys/{key_id}")
+async def update_node_key(key_id: str, request: Request, _=Depends(require_auth)):
     try:
-        if not await check_quota(uid, 0):
-            await websocket.close(code=1008, reason="quota exceeded or link disabled")
-            return
-        address, port, initial_payload, command = await receive_vless_initial(
-            websocket,
-            expected_uuid=uid,
-            max_bytes=CONFIG["max_ws_initial_bytes"],
-            timeout=15.0,
-        )
+        body = await request.json()
+    except Exception:
+        body = {}
+    async with NODE_KEYS_LOCK:
+        entry = NODE_KEYS.get(key_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="key not found")
+        if "label" in body:
+            entry["label"] = (str(body.get("label") or "").strip() or entry["label"])[:60]
+        if "share" in body:
+            cur = entry.get("share") or {}
+            src = body.get("share") if isinstance(body.get("share"), dict) else {}
+            entry["share"] = {p: bool(src.get(p, cur.get(p, p != "logs"))) for p in NODE_SHARE_PARTS}
+        if "can_manage" in body:
+            entry["can_manage"] = bool(body.get("can_manage"))
+        if "password" in body:
+            pw = str(body.get("password") or "").strip()
+            entry["password_hash"] = hash_password(pw) if pw else None
+        if "enabled" in body:
+            entry["revoked"] = not bool(body.get("enabled"))
+        label = entry.get("label", key_id[:8])
+        revoked = entry["revoked"]
+    asyncio.create_task(save_state())
+    log_activity("node", f"کلید نود «{label}» {'غیرفعال شد' if revoked else 'به‌روزرسانی شد'}",
+                 "warn" if revoked else "ok")
+    return {"ok": True, "key_id": key_id}
 
-        # ادز بلاکر: قبل از هر resolve/connect، اگر مقصد در لیست دامنه‌های
-        # تبلیغاتی/ردیاب باشد و قابلیت از پنل فعال شده باشد، اتصال بدون
-        # صرف هیچ منبعی (DNS/TCP) بسته می‌شود. این کار هم پهنای‌باند و هم
-        # زمان کلاینت را برای مقصدهایی که چیزی جز تبلیغ/ردیابی نیستند صرفه‌جویی می‌کند.
-        if is_ad_blocked_domain(address):
-            stats["ads_blocked"] += 1
-            logger.info("🚫 [%s] ad-blocked destination %s:%s", conn_id, address, port)
-            await websocket.close(code=1000, reason="destination blocked by ads blocker")
-            return
 
-        # محافظت SSRF: قبلاً این بررسی فقط برای HTTP Proxy انجام می‌شد، اما
-        # تونل VLESS هم یک راه مستقیم برای اتصال به هر IP:port دلخواه است.
-        # بدون این چک، هر کسی که یک UUID لینک معتبر داشته باشد (که طبیعتاً
-        # قرار است بین چند کاربر به اشتراک گذاشته شود) می‌توانست از طریق
-        # سرور به شبکه‌ی داخلی هاست (localhost، رنج‌های خصوصی، متادیتای
-        # کلاود مثل 169.254.169.254 و ...) دسترسی پیدا کند. همان تابع
-        # resolve_safe_ip که برای پروکسی HTTP نوشته شده اینجا هم استفاده
-        # می‌شود و مستقیماً به IP امن resolve‌شده وصل می‌شویم (نه به hostname)
-        # تا از DNS rebinding هم در امان باشیم.
-        safe_ips = await resolve_safe_ips(address)
-        if not safe_ips:
-            raise ValueError(f"blocked/unresolvable destination: {address}:{port}")
+@app.delete("/api/nodes/keys/{key_id}")
+async def revoke_node_key(key_id: str, _=Depends(require_auth)):
+    async with NODE_KEYS_LOCK:
+        entry = NODE_KEYS.get(key_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="key not found")
+        label = entry.get("label", key_id[:8])
+        del NODE_KEYS[key_id]
+    asyncio.create_task(save_state())
+    log_activity("node", f"کلید نود «{label}» حذف شد", "warn")
+    return {"ok": True, "revoked": key_id}
 
-        proto_label = "UDP" if command == 2 else "TCP"
-        logger.info("➡️  [%s] CONNECT(%s) %s:%s candidates=%s", conn_id, proto_label, address, port, len(safe_ips))
 
-        if command == 2:
-            # UDP relay: هر پکت به‌طور جداگانه با DNS-rebinding-safe IP که
-            # قبلاً resolve شده مرتبط می‌شود. initial_payload اینجا داده‌ی
-            # خامِ آزاد نیست، بلکه طبق پروتکل VLESS به‌صورت
-            # [2-byte length][packet] فریم شده — به همین دلیل برخلاف مسیر
-            # TCP، اینجا آن را زودتر با reserve_usage عمومی نمی‌شماریم؛
-            # upstream_udp_to_target خودش هر پکت را جدا می‌کند و جداگانه
-            # سهمیه/throttle آن را اعمال می‌کند.
-            safe_ip = safe_ips[0]
-            loop = asyncio.get_running_loop()
-            udp_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=1024)
-            udp_transport, _protocol = await loop.create_datagram_endpoint(
-                lambda: _UdpRelayProtocol(udp_queue),
-                remote_addr=(safe_ip, port),
-            )
-            logger.info("✅ [%s] udp relay bound via %s:%s", conn_id, safe_ip, port)
+@app.get("/api/nodes/aggregate")
+async def nodes_aggregate(request: Request, _=Depends(require_auth)):
+    fresh = request.query_params.get("fresh") in ("1", "true", "yes")
+    async with NODES_LOCK:
+        snap = {nid: dict(n) for nid, n in NODES.items()}
+    targets = [(nid, n) for nid, n in snap.items() if n.get("enabled", True)]
+    results = await asyncio.gather(
+        *(_fetch_node_snapshot(nid, n, fresh=fresh) for nid, n in targets),
+        return_exceptions=True,
+    )
 
-            up = asyncio.create_task(
-                upstream_udp_to_target(websocket, udp_transport, conn_id, uid, initial_payload),
-                name=f"vortex-udp-up-{conn_id}",
-            )
-            down = asyncio.create_task(
-                downstream_udp_to_client(websocket, udp_queue, conn_id, uid),
-                name=f"vortex-udp-down-{conn_id}",
-            )
-            done, pending = await asyncio.wait({up, down}, return_when=asyncio.FIRST_COMPLETED)
-            for task in pending:
-                task.cancel()
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
-            for task in done:
-                with contextlib.suppress(Exception):
-                    task.result()
+    nodes_out: list[dict] = []
+    for (nid, n), res in zip(targets, results):
+        base = _node_public(nid, n)
+        if isinstance(res, Exception):
+            base.update({"online": False, "error": str(res)[:200]})
         else:
-            # Count only application payload, not the VLESS framing/header.
-            if initial_payload:
-                ok, speed_limit_bps = await reserve_usage(uid, len(initial_payload))
-                if not ok:
-                    await websocket.close(code=1008, reason="quota exceeded")
-                    return
-                _track(uid, conn_id, len(initial_payload))
-                await throttle(uid, speed_limit_bps, len(initial_payload))
+            base.update(res)
+        nodes_out.append(base)
+    for nid, n in snap.items():
+        if not n.get("enabled", True):
+            nodes_out.append({**_node_public(nid, n), "online": False, "error": None, "disabled": True})
 
-            last_connect_error = None
-            for safe_ip in safe_ips:
-                try:
-                    reader, writer = await asyncio.wait_for(
-                        asyncio.open_connection(safe_ip, port), timeout=10.0
-                    )
-                    logger.info("✅ [%s] connected via %s:%s", conn_id, safe_ip, port)
-                    break
-                except (OSError, asyncio.TimeoutError) as exc:
-                    last_connect_error = exc
-                    logger.warning("⚠️ [%s] connect failed via %s:%s: %s: %s", conn_id, safe_ip, port, type(exc).__name__, exc)
-            else:
-                raise last_connect_error or ConnectionError(f"unable to connect to {address}:{port}")
-            _tune_socket(writer)
-            if initial_payload:
-                writer.write(initial_payload)
-                await writer.drain()
+    local = await get_stats(None)
+    async with LINKS_LOCK:
+        local_used = sum(l.get("used_bytes", 0) for l in LINKS.values())
+    totals = {
+        "local_used_bytes": local_used,
+        "local_requests": local["total_requests"],
+        "local_links": local["links_count"],
+        "local_active_links": local["active_links"],
+        "local_subs": local["subs_count"],
+        "local_connections": local["active_connections"],
+        "node_used_bytes": 0, "node_requests": 0, "node_links": 0,
+        "node_active_links": 0, "node_subs": 0, "node_connections": 0,
+        "nodes_total": len(snap), "nodes_online": 0,
+    }
+    for n in nodes_out:
+        if not n.get("online"):
+            continue
+        totals["nodes_online"] += 1
+        share = n.get("share") or {}
+        st = n.get("stats") or {}
+        if share.get("usage"):
+            totals["node_used_bytes"] += int(st.get("total_bytes") or 0)
+            totals["node_connections"] += int(st.get("active_connections") or 0)
+        if share.get("requests"):
+            totals["node_requests"] += int(st.get("total_requests") or 0)
+        if share.get("links"):
+            links = n.get("links") or []
+            totals["node_links"] += len(links)
+            totals["node_active_links"] += sum(1 for l in links if l.get("active") and not l.get("expired"))
+        if share.get("subs"):
+            totals["node_subs"] += len(n.get("subs") or [])
+    totals["used_bytes"] = totals["local_used_bytes"] + totals["node_used_bytes"]
+    totals["used_fmt"] = fmt_bytes(totals["used_bytes"])
+    totals["node_used_fmt"] = fmt_bytes(totals["node_used_bytes"])
+    totals["requests"] = totals["local_requests"] + totals["node_requests"]
+    totals["links"] = totals["local_links"] + totals["node_links"]
+    totals["active_links"] = totals["local_active_links"] + totals["node_active_links"]
+    totals["subs"] = totals["local_subs"] + totals["node_subs"]
+    totals["connections"] = totals["local_connections"] + totals["node_connections"]
+    return {"nodes": nodes_out, "totals": totals}
 
-            up = asyncio.create_task(upstream_to_client(websocket, writer, conn_id, uid), name=f"vortex-up-{conn_id}")
-            down = asyncio.create_task(downstream_to_client(websocket, reader, conn_id, uid), name=f"vortex-down-{conn_id}")
-            done, pending = await asyncio.wait({up, down}, return_when=asyncio.FIRST_COMPLETED)
-            for task in pending:
-                task.cancel()
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
-            for task in done:
-                with contextlib.suppress(Exception):
-                    task.result()
-    except WebSocketDisconnect:
-        pass
+
+async def _fetch_node_snapshot(node_id: str, node: dict, *, fresh: bool = False) -> dict:
+    """اسنپ‌شات یک نود را با کش کوتاه‌مدت می‌گیرد. فقط بخش‌های تیک‌خورده منتقل می‌شوند."""
+    share = node.get("share") or {}
+    parts = sorted(p for p in NODE_SHARE_PARTS if share.get(p))
+    cache_key = f"{node_id}|{','.join(parts)}"
+    cached = _NODE_CACHE.get(cache_key)
+    if not fresh and cached and (time.time() - cached["at"]) < NODE_CACHE_TTL:
+        return cached["data"]
+    if not parts:
+        return {"online": True, "error": None, "stats": {}, "links": [], "subs": [], "logs": []}
+    try:
+        r = await _node_request(node, "GET", "/api/node/snapshot", params={"parts": ",".join(parts)})
+        if r.status_code == 401:
+            raise RuntimeError("کلید نود روی پنل مقابل ابطال شده است")
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code}")
+        payload = r.json()
     except Exception as exc:
-        stats["total_errors"] += 1
-        error_logs.append({"error": "tunnel request failed", "time": datetime.now().isoformat()})
-        logger.error("tunnel error [%s]: %s: %s", conn_id, type(exc).__name__, exc)
-    finally:
-        if writer:
-            try:
-                writer.close()
-            except Exception:
-                pass
-        if udp_transport:
-            try:
-                udp_transport.close()
-            except Exception:
-                pass
-        connections.pop(conn_id, None)
-        if current_task is not None:
-            RELAY_TASKS.discard(current_task)
-        await release_connection_slot(uid)
-        await release_ip_slot(peer_ip)
-        logger.info("🔌 tunnel closed [%s] active=%d", conn_id, len(connections))
+        msg = str(exc)[:200] or exc.__class__.__name__
+        async with NODES_LOCK:
+            if node_id in NODES:
+                NODES[node_id]["last_error"] = msg
+        return {"online": False, "error": msg, "stats": {}, "links": [], "subs": [], "logs": []}
+
+    now_iso = datetime.now().isoformat()
+    async with NODES_LOCK:
+        if node_id in NODES:
+            NODES[node_id]["last_sync_at"] = now_iso
+            NODES[node_id]["last_error"] = None
+            NODES[node_id]["peer_version"] = payload.get("version")
+    data = {
+        "online": True,
+        "error": None,
+        "last_sync_at": now_iso,
+        "peer_version": payload.get("version"),
+        "stats": payload.get("stats") or {},
+        "links": payload.get("links") or [],
+        "subs": payload.get("subs") or [],
+        "logs": payload.get("logs") or [],
+    }
+    _NODE_CACHE[cache_key] = {"at": time.time(), "data": data}
+    asyncio.create_task(schedule_save())
+    return data
 
 
-# ───────────────────────── HTTP Proxy (authenticated + SSRF-protected) ─────────────────────────
+@app.get("/api/nodes")
+async def list_nodes(_=Depends(require_auth)):
+    async with NODES_LOCK:
+        snap = {nid: dict(n) for nid, n in NODES.items()}
+    out = [_node_public(nid, n) for nid, n in snap.items()]
+    out.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+    return {"nodes": out, "count": len(out)}
 
-PROXY_MAX_BODY_BYTES = CONFIG["max_http_body_bytes"]
 
-_HOP_HEADERS = {
-    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailers", "transfer-encoding", "upgrade", "content-length",
-}
+@app.post("/api/nodes/connect")
+async def connect_node(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    key = str(body.get("key") or "").strip()
+    try:
+        host, _secret = parse_node_key(key)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if host == get_host():
+        raise HTTPException(status_code=400, detail="این کلید مربوط به همین پنل است")
+    async with NODES_LOCK:
+        for nid, n in NODES.items():
+            if n.get("host") == host:
+                raise HTTPException(status_code=409, detail=f"این پنل قبلاً به‌عنوان «{n.get('label')}» متصل شده است")
+
+    node_password = str(body.get("password") or "").strip()
+    candidate = {"host": host, "key": key}
+    try:
+        r = await _node_request(candidate, "POST", "/api/node/handshake",
+                                json_body={"host": get_host(), "version": get_current_version(),
+                                           "password": node_password})
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"اتصال به {host} برقرار نشد: {str(exc)[:160]}")
+    if r.status_code == 401:
+        detail = ""
+        try:
+            detail = r.json().get("detail") or ""
+        except Exception:
+            pass
+        if detail == "PASSWORD_REQUIRED":
+            raise HTTPException(status_code=401, detail="این نود رمز دارد؛ رمز را وارد کنید")
+        if detail == "PASSWORD_INVALID":
+            raise HTTPException(status_code=401, detail="رمز نود اشتباه است")
+        raise HTTPException(status_code=401, detail="کلید توسط پنل مقابل پذیرفته نشد (ابطال‌شده یا نامعتبر)")
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"پاسخ نامعتبر از {host}: HTTP {r.status_code}")
+    info = r.json()
+
+    label = (str(body.get("label") or "").strip() or info.get("host") or host)[:60]
+    node_id = generate_uuid()
+    node = _normalize_node({
+        "label": label, "host": host, "key": key,
+        "peer_version": info.get("version"),
+        "last_sync_at": datetime.now().isoformat(),
+    })
+    async with NODES_LOCK:
+        NODES[node_id] = node
+    _NODE_CACHE.clear()
+    asyncio.create_task(save_state())
+    log_activity("node", f"به نود «{label}» ({host}) متصل شد", "ok")
+    return {"ok": True, "node": _node_public(node_id, node), "peer": info}
 
 
-@app.api_route("/api/proxy/{target_url:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"])
+@app.patch("/api/nodes/{node_id}")
+async def update_node(node_id: str, request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    async with NODES_LOCK:
+        node = NODES.get(node_id)
+        if node is None:
+            raise HTTPException(status_code=404, detail="node not found")
+        if "label" in body:
+            node["label"] = (str(body["label"]).strip() or node["host"])[:60]
+        if "enabled" in body:
+            node["enabled"] = bool(body["enabled"])
+        if "merge_dashboard" in body:
+            node["merge_dashboard"] = bool(body["merge_dashboard"])
+        share = body.get("share")
+        if isinstance(share, dict):
+            for p in NODE_SHARE_PARTS:
+                if p in share:
+                    node["share"][p] = bool(share[p])
+        snap = dict(node)
+    _NODE_CACHE.clear()
+    asyncio.create_task(save_state())
+    return {"ok": True, "node": _node_public(node_id, snap)}
+
+
+@app.delete("/api/nodes/{node_id}")
+async def disconnect_node(node_id: str, _=Depends(require_auth)):
+    async with NODES_LOCK:
+        node = NODES.pop(node_id, None)
+    if node is None:
+        raise HTTPException(status_code=404, detail="node not found")
+    _NODE_CACHE.clear()
+    asyncio.create_task(save_state())
+    log_activity("node", f"اتصال نود «{node.get('label')}» قطع شد", "warn")
+    return {"ok": True, "disconnected": node_id}
+
+
+async def _proxy_node_link_write(node_id: str, uid: str, method: str,
+                                 json_body: dict | None = None) -> dict:
+    async with NODES_LOCK:
+        node = NODES.get(node_id)
+        if node is None:
+            raise HTTPException(status_code=404, detail="node not found")
+        snap = dict(node)
+    try:
+        r = await _node_request(snap, method, f"/api/node/links/{uid}", json_body=json_body)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"نود پاسخ نداد: {str(exc)[:160]}")
+    if r.status_code >= 400:
+        detail = f"HTTP {r.status_code}"
+        try:
+            detail = r.json().get("detail") or detail
+        except Exception:
+            pass
+        raise HTTPException(status_code=r.status_code, detail=detail)
+    _NODE_CACHE.clear()
+    return r.json() if r.content else {"ok": True}
+
+
+@app.post("/api/nodes/{node_id}/subs")
+async def proxy_node_create_sub(node_id: str, request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    async with NODES_LOCK:
+        node = NODES.get(node_id)
+        if node is None:
+            raise HTTPException(status_code=404, detail="node not found")
+        snap = dict(node)
+    try:
+        r = await _node_request(snap, "POST", "/api/node/subs", json_body=body)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"نود پاسخ نداد: {str(exc)[:160]}")
+    if r.status_code >= 400:
+        detail = f"HTTP {r.status_code}"
+        try:
+            detail = r.json().get("detail") or detail
+        except Exception:
+            pass
+        raise HTTPException(status_code=r.status_code, detail=detail)
+    _NODE_CACHE.clear()
+    return r.json()
+
+
+async def _proxy_node_sub_write(node_id: str, sub_id: str, method: str,
+                                 json_body: dict | None = None) -> dict:
+    async with NODES_LOCK:
+        node = NODES.get(node_id)
+        if node is None:
+            raise HTTPException(status_code=404, detail="node not found")
+        snap = dict(node)
+    try:
+        r = await _node_request(snap, method, f"/api/node/subs/{sub_id}", json_body=json_body)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"نود پاسخ نداد: {str(exc)[:160]}")
+    if r.status_code >= 400:
+        detail = f"HTTP {r.status_code}"
+        try:
+            detail = r.json().get("detail") or detail
+        except Exception:
+            pass
+        raise HTTPException(status_code=r.status_code, detail=detail)
+    _NODE_CACHE.clear()
+    return r.json() if r.content else {"ok": True}
+
+
+@app.patch("/api/nodes/{node_id}/subs/{sub_id}")
+async def proxy_node_update_sub(node_id: str, sub_id: str, request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    return await _proxy_node_sub_write(node_id, sub_id, "PATCH", json_body=body)
+
+
+@app.delete("/api/nodes/{node_id}/subs/{sub_id}")
+async def proxy_node_delete_sub(node_id: str, sub_id: str, _=Depends(require_auth)):
+    return await _proxy_node_sub_write(node_id, sub_id, "DELETE")
+
+
+@app.post("/api/nodes/{node_id}/subs/{sub_id}/links")
+async def proxy_node_assign_link_to_sub(node_id: str, sub_id: str, request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    async with NODES_LOCK:
+        node = NODES.get(node_id)
+        if node is None:
+            raise HTTPException(status_code=404, detail="node not found")
+        snap = dict(node)
+    try:
+        r = await _node_request(snap, "POST", f"/api/node/subs/{sub_id}/links", json_body=body)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"نود پاسخ نداد: {str(exc)[:160]}")
+    if r.status_code >= 400:
+        detail = f"HTTP {r.status_code}"
+        try:
+            detail = r.json().get("detail") or detail
+        except Exception:
+            pass
+        raise HTTPException(status_code=r.status_code, detail=detail)
+    _NODE_CACHE.clear()
+    return r.json() if r.content else {"ok": True}
+
+
+@app.post("/api/nodes/{node_id}/links")
+async def proxy_node_create_link(node_id: str, request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    async with NODES_LOCK:
+        node = NODES.get(node_id)
+        if node is None:
+            raise HTTPException(status_code=404, detail="node not found")
+        snap = dict(node)
+    try:
+        r = await _node_request(snap, "POST", "/api/node/links", json_body=body)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"نود پاسخ نداد: {str(exc)[:160]}")
+    if r.status_code >= 400:
+        detail = f"HTTP {r.status_code}"
+        try:
+            detail = r.json().get("detail") or detail
+        except Exception:
+            pass
+        raise HTTPException(status_code=r.status_code, detail=detail)
+    _NODE_CACHE.clear()
+    return r.json()
+
+
+@app.patch("/api/nodes/{node_id}/links/{uid}")
+async def proxy_node_update_link(node_id: str, uid: str, request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    return await _proxy_node_link_write(node_id, uid, "PATCH", json_body=body)
+
+
+@app.delete("/api/nodes/{node_id}/links/{uid}")
+async def proxy_node_delete_link(node_id: str, uid: str, _=Depends(require_auth)):
+    return await _proxy_node_link_write(node_id, uid, "DELETE")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VLESS Relay
+# ══════════════════════════════════════════════════════════════════════════════
+from protocol.vless.vless import (
+    RELAY_BUF,
+    parse_vless_header,
+    check_and_use,
+    relay_ws_to_tcp,
+    relay_tcp_to_ws,
+)
+from protocol.vless.websocket import websocket_tunnel
+
+from protocol.trojan.websocket import trojan_ws_tunnel
+
+app.add_api_websocket_route("/ws/{uuid}", websocket_tunnel)
+app.add_api_websocket_route("/trojan-ws", trojan_ws_tunnel)
+from protocol.shadowsocks.shadowsocks import generate_ss_link, derive_key, CIPHERS, DEFAULT_CIPHER
+from protocol.shadowsocks.websocket import shadowsocks_ws_tunnel
+app.add_api_websocket_route("/ss-ws", shadowsocks_ws_tunnel)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# XHTTP
+# ══════════════════════════════════════════════════════════════════════════════
+# نکته: مطابق نسخه‌ی مرجع (xhttp_siz10.py) مود stream-one حذف شده؛ فقط
+# packet-up و stream-up فعال هستن. روترهای stream-one دیگه include نمی‌شن.
+from protocol.vless.xhttpstreamon import router as xhttp_downlink_router
+from protocol.vless.xhttpstreamup import router as xhttp_streamup_router
+from protocol.vless.xhttshadpacketup import router as xhttp_packetup_router
+app.include_router(xhttp_downlink_router)
+app.include_router(xhttp_streamup_router)
+app.include_router(xhttp_packetup_router)
+
+from protocol.trojan.xhttpstreamon import router as trojan_xhttp_downlink_router
+from protocol.trojan.xhttpstreamup import router as trojan_xhttp_streamup_router
+from protocol.trojan.xhttshadpacketup import router as trojan_xhttp_packetup_router
+app.include_router(trojan_xhttp_downlink_router)
+app.include_router(trojan_xhttp_streamup_router)
+app.include_router(trojan_xhttp_packetup_router)
+
+# ── HTTP Proxy ────────────────────────────────────────────────────────────────
+_HOP = {"connection","keep-alive","proxy-authenticate","proxy-authorization",
+        "te","trailers","transfer-encoding","upgrade","content-encoding","content-length"}
+
+@app.api_route("/proxy/{target_url:path}", methods=["GET","POST","PUT","DELETE","PATCH","HEAD","OPTIONS"])
 async def http_proxy(target_url: str, request: Request):
-    await require_auth(request)
-    if request.method not in {"GET", "HEAD"}:
-        await require_auth_csrf(request)
-    if len(target_url) > CONFIG["proxy_max_url_length"]:
-        raise HTTPException(status_code=414, detail="proxy URL too long")
-    if not target_url.lower().startswith(("http://", "https://")):
+    if not target_url.startswith("http"):
         target_url = "https://" + target_url
-    if request.url.query:
-        target_url = f"{target_url}?{request.url.query}"
-    if len(target_url) > CONFIG["proxy_max_url_length"]:
-        raise HTTPException(status_code=414, detail="proxy URL too long")
-
-    allowed, reason, safe_ip = await is_proxy_target_allowed(target_url)
-    if not allowed:
-        raise HTTPException(status_code=403, detail=f"proxy target rejected: {reason}")
-
-    content_length = request.headers.get("content-length")
-    if content_length and content_length.isdigit() and int(content_length) > PROXY_MAX_BODY_BYTES:
-        raise HTTPException(status_code=413, detail="request body too large")
-
     try:
         body = await request.body()
-        if len(body) > PROXY_MAX_BODY_BYTES:
-            raise HTTPException(status_code=413, detail="request body too large")
-        parsed = urlparse(target_url)
-        if parsed.username or parsed.password:
-            raise HTTPException(status_code=400, detail="userinfo in proxy URL is not allowed")
-        headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_HEADERS and k.lower() != "host"}
-        pinned_netloc = safe_ip if ":" not in safe_ip else f"[{safe_ip}]"
-        if parsed.port:
-            pinned_netloc += f":{parsed.port}"
-        pinned_url = parsed._replace(netloc=pinned_netloc).geturl()
-        headers["host"] = parsed.hostname
-
-        response_ctx = http_client.stream(
-            method=request.method, url=pinned_url, headers=headers, content=body,
-            extensions={"sni_hostname": parsed.hostname},
-        )
-        resp = await response_ctx.__aenter__()
-
-        async def stream_response():
-            total = 0
-            try:
-                async for chunk in resp.aiter_bytes(RELAY_BUF):
-                    total += len(chunk)
-                    if total > CONFIG["proxy_max_response_bytes"]:
-                        raise RuntimeError("proxy response exceeded configured limit")
-                    stats["total_bytes"] += len(chunk)
-                    stats["total_requests"] += 1
-                    hourly_traffic[datetime.now().strftime("%H:00")] += len(chunk)
-                    yield chunk
-            finally:
-                await resp.aclose()
-                await response_ctx.__aexit__(None, None, None)
-
-        resp_headers = {k: v for k, v in resp.headers.items() if k.lower() not in _HOP_HEADERS}
-        return StreamingResponse(stream_response(), status_code=resp.status_code, headers=resp_headers)
-    except HTTPException:
-        raise
+        headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP and k.lower() != "host"}
+        resp = await http_client.request(method=request.method, url=target_url, headers=headers, content=body)
+        stats["total_bytes"] += len(resp.content)
+        stats["total_requests"] += 1
+        hourly_traffic[now_ir().strftime("%H:00")] += len(resp.content)
+        return Response(content=resp.content, status_code=resp.status_code,
+                        headers={k: v for k, v in resp.headers.items() if k.lower() not in _HOP})
     except Exception as exc:
         stats["total_errors"] += 1
-        error_logs.append({"error": "proxy request failed", "time": datetime.now().isoformat()})
-        logger.error("proxy request failed: %s", exc)
-        raise HTTPException(status_code=502, detail="proxy error: unable to reach target")
+        error_logs.append({"error": str(exc), "url": target_url, "time": datetime.now().isoformat()})
+        raise HTTPException(status_code=502, detail=f"Proxy error: {exc}")
+
+# ── Public sub page ───────────────────────────────────────────────────────────
+@app.get("/p/{uuid_key}", response_class=HTMLResponse)
+async def public_sub_page(uuid_key: str, request: Request):
+    from pages import get_public_page_html
+    async with SUBS_LOCK:
+        sub = next(({"sub_id": sid, **s} for sid, s in SUBS.items() if s.get("uuid_key") == uuid_key), None)
+    if not sub:
+        return HTMLResponse("<h2 style='font-family:sans-serif;padding:40px'>گروه پیدا نشد</h2>", status_code=404)
+    return HTMLResponse(content=get_public_page_html(uuid_key))
 
 
-# ───────────────────────── Web UI ─────────────────────────
 
-from templates import DASHBOARD_HTML, LOGIN_HTML, SUB_HTML, SUB_NOTFOUND_HTML  # noqa: E402
+@app.get("/api/public/sub/{uuid_key}")
+async def public_sub_data(uuid_key: str, request: Request):
+    # ۱. احراز هویت و دریافت داده‌ها (همان منطق قبلی شما)
+    async with SUBS_LOCK:
+        sub_entry = next(((sid, s) for sid, s in SUBS.items() if s.get("uuid_key") == uuid_key), None)
+    if not sub_entry:
+        raise HTTPException(status_code=404, detail="not found")
+    sub_id, sub = sub_entry
+
+    has_pw = sub.get("password_hash") is not None
+    if has_pw:
+        pw = request.query_params.get("pw", "")
+        if hash_password(pw) != sub["password_hash"]:
+            return JSONResponse({"locked": True, "name": sub["name"]})
+
+    host = get_host()
+    link_ids = sub.get("link_ids", [])
+    node_link_ids = sub.get("node_link_ids", [])
+    async with LINKS_LOCK:
+        snap = dict(LINKS)
+
+    links_out = []
+    active_conns = 0
+    
+    # ۲. ساخت لیست کانفیگ‌ها
+    for lid in link_ids:
+        link = snap.get(lid)
+        if not link: continue
+        allowed = is_link_allowed(link)
+        conn_count = sum(1 for c in connections.values() if c.get("uuid") == lid)
+        active_conns += conn_count
+        proto = link.get("protocol", DEFAULT_PROTOCOL)
+        links_out.append({
+            "uuid": lid,
+            "label": link["label"],
+            "active": allowed,
+            "protocol": proto,
+            "used_bytes": link.get("used_bytes", 0),
+            "limit_bytes": link.get("limit_bytes", 0),
+            "vless_link": generate_share_link(lid, host, remark=f"RVG-{link['label']}", protocol=proto),
+        })
+
+    # ۲.۵ کانفیگ‌های نودهای دیگر
+    if node_link_ids:
+        async with NODES_LOCK:
+            nodes_snap = {nid: dict(n) for nid, n in NODES.items()}
+        needed_nodes = list({ref.split("::", 1)[0] for ref in node_link_ids if "::" in ref})
+        needed_nodes = [nid for nid in needed_nodes if nid in nodes_snap]
+        snapshots = await asyncio.gather(
+            *(_fetch_node_snapshot(nid, nodes_snap[nid], fresh=True) for nid in needed_nodes),
+            return_exceptions=True,
+        )
+        snap_by_node = dict(zip(needed_nodes, snapshots))
+        for ref in node_link_ids:
+            if "::" not in ref:
+                continue
+            nid, uid = ref.split("::", 1)
+            node_snap = snap_by_node.get(nid)
+            if not node_snap or isinstance(node_snap, Exception):
+                continue
+            node_link = next((l for l in (node_snap.get("links") or []) if l.get("uuid") == uid), None)
+            if not node_link or not node_link.get("vless_link"):
+                continue
+            lb = node_link.get("limit_bytes", 0)
+            allowed = bool(node_link.get("active", True)) and not node_link.get("expired") and not (lb > 0 and node_link.get("used_bytes", 0) >= lb)
+            links_out.append({
+                "uuid": nid + "::" + uid,
+                "label": node_link.get("label", uid),
+                "active": allowed,
+                "protocol": node_link.get("protocol", DEFAULT_PROTOCOL),
+                "used_bytes": node_link.get("used_bytes", 0),
+                "limit_bytes": node_link.get("limit_bytes", 0),
+                "vless_link": node_link["vless_link"],
+            })
+
+    # ۲.۶ کانفیگ‌های ایستا (foreign_links) — مثلاً کانفیگ‌های پنل مرکزی که روی
+    # یک نود اضافه شده‌اند؛ چون این نود به پنل مرکزی دسترسی برگشتی ندارد،
+    # این کانفیگ‌ها به‌صورت اسنپ‌شات (لینک آماده) ذخیره و همینجا نمایش داده می‌شوند.
+    for fl in sub.get("foreign_links", []):
+        vl = fl.get("vless_link")
+        if not vl:
+            continue
+        links_out.append({
+            "uuid": fl.get("key") or vl,
+            "label": fl.get("label", "کانفیگ"),
+            "active": True,
+            "protocol": fl.get("protocol", DEFAULT_PROTOCOL),
+            "used_bytes": fl.get("used_bytes", 0),
+            "limit_bytes": 0,
+            "vless_link": vl,
+        })
+
+    # ۳. تشخیص کلاینت یا مرورگر
+    user_agent = request.headers.get("User-Agent", "").lower()
+    is_client = any(ua in user_agent for ua in ["v2rayng", "v2rayn", "shadowrocket", "clash", "surfboard", "nekoray"])
+
+    if is_client:
+        # اگر کلاینت است: فقط لینک‌های فعال را به صورت Base64 برگردان
+        raw_links = "\n".join([l["vless_link"] for l in links_out if l["active"]])
+        encoded_data = base64.b64encode(raw_links.encode("utf-8")).decode("utf-8")
+        return Response(content=encoded_data, media_type="text/plain")
+
+    # ۴. اگر مرورگر است: دیتای کامل JSON را برگردان
+    return {
+        "locked": False,
+        "name": f"پنل: {sub['name']}",
+        "desc": sub.get("desc", ""),
+        "sub_url": f"https://{host}/sub-group/{uuid_key}",
+        "active_connections": active_conns,
+        "links": links_out, # اینجا همان لیست کامل شماست
+    }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Version / Auto-Update
+# ══════════════════════════════════════════════════════════════════════════════
+from updater import (
+    get_current_version, get_current_version_info,
+    get_latest_version_info, perform_update,
+    update_log, update_state, load_update_history,
+    REPO, BRANCH, is_newer_version,
+)
+
+@app.get("/api/version")
+async def api_version(_=Depends(require_auth)):
+    current_info = get_current_version_info()
+    latest_info = await get_latest_version_info()
+    latest_ver = latest_info.get("version")
+    update_available = is_newer_version(latest_ver, current_info["version"]) if latest_ver else False
+    return {
+        "repo": REPO,
+        "branch": BRANCH,
+        "current": current_info,
+        "latest": latest_info,
+        "update_available": update_available,
+    }
+
+@app.get("/api/update-history")
+async def api_update_history(_=Depends(require_auth)):
+    return {"history": load_update_history()}
+
+@app.get("/api/update-log")
+async def api_update_log(_=Depends(require_auth)):
+    return {"running": update_state["running"], "progress": update_state["progress"], "logs": list(update_log)[-100:]}
+
+@app.post("/api/update")
+async def api_update(_=Depends(require_auth)):
+    if update_state["running"]:
+        raise HTTPException(status_code=409, detail="بروزرسانی در حال اجراست")
+    update_log.append({"time": time.time(), "msg": "درخواست بروزرسانی ثبت شد، در صف اجرا..."})
+
+    async def _run():
+        ok = False
+        try:
+            ok = await perform_update()
+        except Exception as exc:
+            import traceback as tb
+            update_log.append({"time": time.time(), "msg": f"❌ خطای بحرانی: {exc}"})
+            update_log.append({"time": time.time(), "msg": tb.format_exc()[-800:]})
+            update_state["running"] = False
+        try:
+            await save_state()
+            log_activity("system", "بروزرسانی پنل " + ("موفق" if ok else "ناموفق") + " بود", "ok" if ok else "err")
+        except Exception:
+            pass
+        if ok:
+            update_log.append({"time": time.time(), "msg": "در حال راه‌اندازی مجدد پروسه (بدون خاموش‌شدن کانتینر)..."})
+            await asyncio.sleep(1.5)
+            try:
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+            except Exception as exc:
+                update_log.append({"time": time.time(), "msg": f"❌ execv شکست خورد: {exc} — fallback به exit"})
+                os._exit(0)
+
+    task = asyncio.create_task(_run())
+
+    def _on_done(t: asyncio.Task):
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc:
+            update_log.append({"time": time.time(), "msg": f"❌ Task crash: {exc}"})
+            update_state["running"] = False
+
+    task.add_done_callback(_on_done)
+    log_activity("system", "درخواست بروزرسانی پنل ثبت شد", "info")
+    return {"ok": True, "started": True}
+
+# ── Settings: توقف کامل لاگ‌گیری (برای بیشترین throughput ممکن) ─────────────────
+@app.get("/api/settings/logging")
+async def get_logging_setting(_=Depends(require_auth)):
+    return {"disabled": bool(CONFIG.get("disable_logging"))}
 
 
-def _with_csp_nonce(page_html: str, nonce: str) -> str:
-    # فقط تگ‌های <script> بدون src (اسکریپت inline خودمان) را nonce می‌زنیم؛
-    # تگ <script src="https://cdnjs..."> دست‌نخورده می‌ماند چون از طریق
-    # host-source در CSP مجاز شده، نه نیاز به nonce دارد.
-    return page_html.replace("<script>", f'<script nonce="{nonce}">')
+@app.post("/api/settings/logging")
+async def set_logging_setting(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    disabled = bool(body.get("disabled"))
+    CONFIG["disable_logging"] = disabled
+    apply_logging_state()
+    await save_state()
+    return {"ok": True, "disabled": disabled}
 
+
+# ── HTML Pages ───────────────────────────────────────────────────────────────
+from pages import LOGIN_HTML, DASHBOARD_HTML
+
+# ── Central: Announcements & Support ─────────────────────────────────────────
+@app.get("/api/announcements")
+async def api_announcements(_=Depends(require_auth)):
+    return {"announcements": await central.fetch_announcements()}
+
+@app.post("/api/announcements/view")
+async def api_announcements_view(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    ids = body.get("ids", [])
+    if not isinstance(ids, list):
+        raise HTTPException(status_code=400, detail="invalid ids")
+    await central.report_announcement_views([str(i) for i in ids][:100])
+    return {"ok": True}
+
+@app.get("/api/support/messages")
+async def api_support_messages(_=Depends(require_auth)):
+    messages, blocked = await central.fetch_support_messages()
+    return {"messages": messages, "blocked": blocked}
+
+@app.post("/api/support/send")
+async def api_support_send(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    msg = str(body.get("message", "")).strip()[:2000]
+    if not msg:
+        raise HTTPException(status_code=400, detail="پیام خالی است")
+    result = await central.send_support_message(msg)
+    if result.get("blocked"):
+        raise HTTPException(status_code=403, detail="شما توسط پشتیبانی بلاک شده‌اید")
+    if not result.get("ok"):
+        raise HTTPException(status_code=502, detail=result.get("error") or "ارتباط با سرور مرکزی برقرار نشد")
+    return {"ok": True}
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
-    token = request.cookies.get(SESSION_COOKIE)
-    if await is_valid_session(token):
+    if await is_valid_session(request.cookies.get(SESSION_COOKIE)):
         return RedirectResponse(url="/dashboard")
-    return HTMLResponse(content=_with_csp_nonce(LOGIN_HTML, request.state.csp_nonce))
-
+    return HTMLResponse(content=LOGIN_HTML)
 
 @app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard_page(request: Request):
-    token = request.cookies.get(SESSION_COOKIE)
-    if not await is_valid_session(token):
+async def dashboard(request: Request):
+    if not await is_valid_session(request.cookies.get(SESSION_COOKIE)):
         return RedirectResponse(url="/login")
     await ensure_default_link()
-    return HTMLResponse(content=_with_csp_nonce(DASHBOARD_HTML, request.state.csp_nonce))
+    return HTMLResponse(content=DASHBOARD_HTML)
 
-
-# ───────────────────────── Subscription page ─────────────────────────
-# آدرس عمومی (بدون نیاز به لاگین پنل — دقیقاً مثل /tunnel/{uid}، خودِ uuid
-# لینک نقش «رمز اشتراک» را بازی می‌کند) که با کاربر نهایی به اشتراک گذاشته
-# می‌شود. دو نوع کلاینت این آدرس را می‌زنند:
-#   ۱) مرورگر یک انسان → صفحه‌ی HTML خوانا با وضعیت/مصرف/QR
-#   ۲) اپ‌های VPN (V2rayNG/NekoBox/Clash/...) که این آدرس را به‌عنوان
-#      subscription URL اضافه کرده‌اند و خودشان دوره‌ای فچش می‌کنند →
-#      محتوای base64 استاندارد + هدرهای Subscription-Userinfo
-# تشخیص بر اساس User-Agent است؛ اگر اپی شناسایی نشد، صفحه‌ی انسانی برگردانده
-# می‌شود (بی‌ضرر — فقط یعنی آن اپ لینک را در صفحه پیدا نمی‌کند، نه خطا).
-
-SUBSCRIPTION_CLIENT_UA_MARKERS = (
-    "v2rayng", "v2rayn", "nekobox", "nekoray", "clash", "clashx", "clash-verge",
-    "flclash", "shadowrocket", "streisand", "hiddify", "sing-box", "sfa", "sfi",
-    "sfm", "v2box", "furious", "matsuri", "kitsunebi", "quantumult", "surge",
-    "loon", "stash", "karing", "husi", "happ",
-)
-
-
-def _is_subscription_client(user_agent: str) -> bool:
-    ua = (user_agent or "").lower()
-    return any(marker in ua for marker in SUBSCRIPTION_CLIENT_UA_MARKERS)
-
-
-def _fmt_bytes_fa(n: int) -> str:
-    if n >= 1024 ** 3:
-        return f"{n / 1024 ** 3:.2f} GB"
-    if n >= 1024 ** 2:
-        return f"{n / 1024 ** 2:.1f} MB"
-    if n >= 1024:
-        return f"{n / 1024:.1f} KB"
-    return f"{n} B"
-
-
-def _fmt_speed_fa(bps: int) -> str:
-    if not bps:
-        return "نامحدود"
-    if bps >= 1024 ** 2:
-        return f"{bps / 1024 ** 2:.1f} MB/s"
-    return f"{bps / 1024:.0f} KB/s"
-
-
-def _days_left(expires_at: str | None) -> int:
-    """تعداد روزهای باقی‌مانده تا انقضا (سقف‌گرد به بالا، حداقل ۰). فرض بر
-    این است که قبلاً is_link_expired چک شده و لینک هنوز منقضی نیست."""
-    if not expires_at:
-        return 0
-    try:
-        exp = datetime.fromisoformat(expires_at)
-    except ValueError:
-        return 0
-    remaining_seconds = int((exp - datetime.now()).total_seconds())
-    if remaining_seconds <= 0:
-        return 0
-    return -(-remaining_seconds // 86400)  # ceiling division
-
-
-@app.get("/sub/{token}")
-async def subscription_page(token: str, request: Request):
-    async with LINKS_LOCK:
-        uid = SUBSCRIPTION_INDEX.get(token)
-        snapshot = dict(LINKS[uid]) if uid and uid in LINKS else None
-        # Constant-time comparison is still used for the token itself at the
-        # security boundary; the index only narrows the candidate to O(1).
-        if snapshot is not None:
-            stored_token = str(snapshot.get("subscription_token", ""))
-            if not hmac.compare_digest(stored_token, token):
-                snapshot = None
-                uid = None
-        # Optional compatibility window for old UUID-based subscription URLs.
-        if snapshot is None and CONFIG["allow_legacy_subscription_uuid"]:
-            candidate = LINKS.get(token)
-            if candidate is not None:
-                uid = token
-                snapshot = dict(candidate)
-
-    if snapshot is None:
-        return HTMLResponse(
-            content=_with_csp_nonce(SUB_NOTFOUND_HTML, request.state.csp_nonce),
-            status_code=404,
-        )
-
-    host = get_host()
-    vless_link = generate_vless_link(uid, host, remark=f"Vortex-{snapshot['label']}")
-    sub_link = generate_sub_url(uid, host)
-    expired = is_link_expired(snapshot)
-
-    accept = (request.headers.get("accept") or "").lower()
-    user_agent = request.headers.get("user-agent", "")
-    browser_like = "mozilla/" in user_agent.lower() or "chrome/" in user_agent.lower() or "safari/" in user_agent.lower()
-    wants_machine_subscription = (
-        _is_subscription_client(user_agent)
-        or (not browser_like and "text/html" not in accept)
-        or (not browser_like and accept in {"", "*/*"})
-        or request.query_params.get("format", "").lower() in {"sub", "base64", "vless"}
-    )
-    if wants_machine_subscription:
-        # Machine-readable subscription: one VLESS URI per line, base64 encoded.
-        content = base64.b64encode((vless_link + "\n").encode()).decode()
-        expire_ts = 0
-        if snapshot.get("expires_at"):
-            try:
-                expire_ts = int(datetime.fromisoformat(snapshot["expires_at"]).timestamp())
-            except ValueError:
-                expire_ts = 0
-        headers = {
-            # اکثر کلاینت‌ها هر چند ساعت یک‌بار (طبق این هدر) ساب را خودکار
-            # رفرش می‌کنند تا تغییرات ادمین (فعال/غیرفعال، سقف جدید) اعمال شود.
-            "Profile-Update-Interval": "12",
-            "Profile-Title": base64.b64encode(snapshot["label"].encode()).decode(),
-            "Subscription-Userinfo": (
-                f"upload=0; download={snapshot['used_bytes']}; "
-                f"total={snapshot['limit_bytes']}; expire={expire_ts}"
-            ),
-            "Content-Type": "text/plain; charset=utf-8",
-            "Cache-Control": "no-store, no-cache, must-revalidate",
-        }
-        return PlainTextResponse(content=content, headers=headers)
-
-    # پاسخ انسانی: صفحه‌ی HTML با وضعیت لینک
-    if expired:
-        status_badge = '<span class="badge warn"><i class="ti ti-clock-off"></i> منقضی‌شده</span>'
-    elif not snapshot["active"]:
-        status_badge = '<span class="badge warn"><i class="ti ti-player-pause"></i> غیرفعال</span>'
-    else:
-        status_badge = '<span class="badge ok"><i class="ti ti-circle-check"></i> فعال</span>'
-
-    limit_bytes = snapshot["limit_bytes"]
-    used_bytes = snapshot["used_bytes"]
-    percent = min(100, round(used_bytes / limit_bytes * 100, 1)) if limit_bytes else 0
-    used_str = _fmt_bytes_fa(used_bytes)
-    limit_str = "نامحدود" if limit_bytes == 0 else _fmt_bytes_fa(limit_bytes)
-
-    if not snapshot.get("expires_at"):
-        days_str = "بدون انقضا"
-    elif expired:
-        days_str = "منقضی‌شده"
-    else:
-        days_str = f"{_days_left(snapshot['expires_at'])} روز"
-
-    speed_str = _fmt_speed_fa(snapshot.get("speed_limit_bps", 0))
-
-    page = (
-        SUB_HTML
-        .replace("__LABEL__", html.escape(snapshot["label"]))
-        .replace("__STATUS_BADGE__", status_badge)
-        .replace("__PERCENT__", str(percent))
-        .replace("__USED__", html.escape(used_str))
-        .replace("__LIMIT__", html.escape(limit_str))
-        .replace("__DAYS__", html.escape(days_str))
-        .replace("__SPEED__", html.escape(speed_str))
-        .replace("__VLESS_LINK_TEXT__", html.escape(vless_link))
-        .replace("__VLESS_LINK_JSON__", json.dumps(vless_link))
-        .replace("__SUB_LINK_JSON__", json.dumps(sub_link))
-        .replace("__LABEL_JSON__", json.dumps(snapshot["label"]))
-    )
-    return HTMLResponse(content=_with_csp_nonce(page, request.state.csp_nonce))
-
+@app.get("/test-ws", response_class=HTMLResponse)
+async def test_ws_redirect():
+    return HTMLResponse(content="<script>location.href='/dashboard'</script>")
 
 if __name__ == "__main__":
-    # ws_max_size: سقف اندازه‌ی هر فریم وب‌سوکت (پیش‌فرض کتابخانه‌ی websockets معمولاً
-    # ۱۶ مگابایت است که برای یک تونل عمومی زیاده؛ این‌جا محدودش می‌کنیم تا یک کلاینت
-    # بدخواه نتواند با فریم‌های غول‌آسا حافظه‌ی سرور را مصرف کند).
     uvicorn.run(
-        app, host="0.0.0.0", port=CONFIG["port"], ws_max_size=4 * 1024 * 1024,
-        proxy_headers=False,  # client IP forwarding is validated by our own trusted-CIDR logic
+        app,
+        host="0.0.0.0",
+        port=CONFIG["port"],
+        log_level="info",
+        workers=1,
+        loop="auto",         # uvloop رو در صورت نصب بودن استفاده می‌کنه، وگرنه بدون کرش fallback می‌کنه
+        http="auto",
     )
