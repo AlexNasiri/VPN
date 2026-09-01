@@ -1,571 +1,393 @@
-<div align="center">
+# 🌀 Vortex Gateway
 
-<img src="https://capsule-render.vercel.app/api?type=waving&color=0:0f2027,50:203a43,100:2c5364&height=220&section=header&text=RVG%20Gateway&fontSize=60&fontColor=ffffff&animation=fadeIn&fontAlignY=38&desc=Multi-Protocol%20Proxy%20Management%20Panel&descAlignY=58&descSize=18" width="100%"/>
+**زبان‌ها:** فارسی (اصلی) · [English](README_EN.md)
 
-<a href="#-english"><img src="https://img.shields.io/badge/🇬🇧-English-0f2027?style=for-the-badge" /></a>
-<a href="#-فارسی"><img src="https://img.shields.io/badge/🇮🇷-فارسی-203a43?style=for-the-badge" /></a>
+Vortex Gateway یک Gateway سخت‌سازی‌شده برای **VLESS روی WebSocket** است که داشبورد مدیریت، سهمیه و محدودیت اتصال/ترافیک، HTTP Proxy کنترل‌شده، Backup رمزنگاری‌شده SQLite، Redis اختیاری برای Session و Rate Limit توزیع‌شده، و Cloudflare Worker Relay اختیاری را ارائه می‌دهد.
 
-<br/>
+نسخه فعلی: **4.1-hardened**
 
-![Typing SVG](https://readme-typing-svg.demolab.com?font=Fira+Code&weight=600&size=22&pause=1000&color=2C5364&center=true&vCenter=true&width=600&lines=Fast+%26+Modern+Proxy+Gateway;VLESS+%7C+Trojan+%7C+Shadowsocks+%7C+MTProto;Built+with+FastAPI+%2B+Python;Deploy+to+Railway+in+One+Click)
-
-<br/>
-
-[![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
-[![FastAPI](https://img.shields.io/badge/FastAPI-Async-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
-[![Railway](https://img.shields.io/badge/Deploy-Railway-0B0D0E?style=for-the-badge&logo=railway&logoColor=white)](https://railway.app)
-[![License](https://img.shields.io/badge/License-Custom-red?style=for-the-badge)](./LICENSE)
-
-![Stars](https://img.shields.io/github/stars/arvin341az-glitch/RVG?style=social)
-![Forks](https://img.shields.io/github/forks/arvin341az-glitch/RVG?style=social)
-![Last Commit](https://img.shields.io/github/last-commit/arvin341az-glitch/RVG?color=2c5364)
-![Repo Size](https://img.shields.io/github/repo-size/arvin341az-glitch/RVG?color=0f2027)
-
-</div>
-
-<br/>
+> ⚠️ **نکته امنیتی:** VLESS UUID، Subscription URL/Token، نشست ادمین و کلید Backup را Secret در نظر بگیرید. هرگز `.env`، دیتابیس Production، API Token یا Backupهای واقعی را commit نکنید.
 
 ---
 
-<div align="center">
-<h1>🇬🇧 English</h1>
-</div>
-
-## 📖 Table of Contents
-
-- [Overview](#-overview)
-- [Features](#-features)
-- [Supported Protocols](#-supported-protocols)
-- [Architecture](#-architecture)
-- [Project Structure](#-project-structure)
-- [Quick Start (Railway)](#-quick-start-railway-deploy)
-- [Local Development](#-local-development)
-- [Environment Variables](#-environment-variables)
-- [Dashboard Preview](#-dashboard-preview)
-- [Roadmap](#-roadmap)
-- [Contributing](#-contributing)
-- [License](#-license)
-- [Support the Project](#-support-the-project)
-
-<br/>
-
-## 🚀 Overview
-
-**RVG Gateway** is a fast, modern, self-hosted **multi-protocol proxy management panel**, built with **Python + FastAPI**, designed to deploy in minutes on **Railway**.
-
-It gives you a beautiful admin dashboard to create, monitor, and manage proxy links across multiple protocols — with per-link traffic quotas, live connection stats, and QR code generation — all from a single lightweight service.
-
-> 💡 Originally built around a simple VLESS-over-WebSocket relay, RVG has evolved into a full multi-protocol gateway with authentication, quota tracking, and a polished management UI.
-
-<br/>
-
-## ✨ Features
-
-<table>
-<tr>
-<td width="50%">
-
-### 🔌 Core Gateway
-- VLESS over WebSocket (TLS 443)
-- Trojan, Shadowsocks (AEAD / aes-256-gcm)
-- MTProto proxy via `mtg` binary
-- Internal HTTP Proxy
-- xHTTP / gRPC / HTTPUpgrade transports
-
-</td>
-<td width="50%">
-
-### 📊 Management Dashboard
-- Real-time traffic charts & trend indicators
-- Live connection monitoring
-- Unlimited link creation with per-link quotas (MB/GB)
-- Instant enable / disable per link
-- QR Code export for every link
-
-</td>
-</tr>
-<tr>
-<td width="50%">
-
-### 🛡️ Security & Reliability
-- Strict UUID validation
-- Session-based authentication
-- TLS fingerprint spoofing (Chrome)
-- Optimized relay buffers (512KB, `TCP_NODELAY`, `SO_KEEPALIVE`)
-
-</td>
-<td width="50%">
-
-### 🤖 Automation
-- Telegram-bot-integrated proxy management
-- Domain suggestion via Cloudflare Worker
-- Automated TCP proxy dispatch with blacklist targeting
-- One-click Railway deployment
-
-</td>
-</tr>
-</table>
-
-<br/>
-
-## 🌐 Supported Protocols
-
-| Protocol | Transport | Status |
-|---|---|:---:|
-| VLESS | WebSocket / xHTTP / gRPC | ✅ |
-| Trojan | WebSocket / HTTPUpgrade | ✅ |
-| Shadowsocks | AEAD (aes-256-gcm) | ✅ |
-| MTProto | `mtg` v2.1.7 | ✅ |
-| HTTP Proxy | Internal | ✅ |
-
-<br/>
-
-## 🏗️ Architecture
-
-```mermaid
-flowchart LR
-    A[Client / v2rayNG / NekoBox] -->|VLESS / Trojan / SS| B(RVG Gateway<br/>FastAPI Server)
-    B --> C{Protocol Router}
-    C -->|WebSocket| D[VLESS / Trojan Relay]
-    C -->|TCP| E[Shadowsocks Relay]
-    C -->|mtg binary| F[MTProto Relay]
-    B --> G[(In-Memory<br/>Link & Quota Store)]
-    B --> H[Admin Dashboard :8000/dashboard]
-    B --> I[Telegram Bot Automation]
-    style B fill:#203a43,stroke:#0f2027,color:#fff
-    style H fill:#2c5364,stroke:#0f2027,color:#fff
-```
-
-<br/>
-
-## 📂 Project Structure
-
-```
-RVG/
-├── protocol/                 # Per-protocol relay implementations
-├── main.py                   # FastAPI app entrypoint
-├── central.py                 # Core orchestration logic
-├── pages.py                   # Dashboard route/page handlers
-├── updater.py                  # Self-update logic
-├── botgeneratedomin.py         # Telegram bot: domain generation
-├── bottokentcpproxy.py         # TCP proxy automation via Telegram
-├── zeussocks5.py                # SOCKS5 proxy handler
-├── requirements.txt
-├── .gitignore
-└── README.md
-```
-
-<br/>
-
-## ⚡ Quick Start (Railway Deploy)
-
-<table>
-<tr>
-<td width="60px" align="center">1️⃣</td>
-<td>
-
-**Fork this repository**
-
-```
-https://github.com/arvin341az-glitch/RVG/fork
-```
-
-</td>
-</tr>
-<tr>
-<td align="center">2️⃣</td>
-<td>
-
-**Deploy on Railway**
-
-1. Go to [Railway.app](https://railway.app)
-2. Click **New Project → Deploy from GitHub repo**
-3. Select your forked repository
-4. Railway auto-builds and deploys 🎉
-
-</td>
-</tr>
-<tr>
-<td align="center">3️⃣</td>
-<td>
-
-**Enable a public domain**
-
-Railway → Settings → Networking → **Generate Domain**
-(this sets `RAILWAY_PUBLIC_DOMAIN` automatically)
-
-</td>
-</tr>
-<tr>
-<td align="center">4️⃣</td>
-<td>
-
-**Open your dashboard**
-
-```
-https://your-app.up.railway.app/dashboard
-```
-
-Copy the default VLESS link and import it into your client (v2rayNG, NekoBox, Streisand, …).
-
-</td>
-</tr>
-</table>
-
-<br/>
-
-## 💻 Local Development
-
-```bash
-# Clone your fork
-git clone https://github.com/<your-username>/RVG.git
-cd RVG
-
-# Create a virtual environment
-python -m venv venv
-source venv/bin/activate   # Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Run the server
-python main.py
-```
-
-The dashboard will be available at `http://localhost:8000/dashboard`.
-
-<br/>
-
-## ⚙️ Environment Variables
-
-| Variable | Description | Default |
-|---|---|---|
-| `PORT` | Port the service runs on | `8000` |
-| `SECRET_KEY` | Internal security key | Randomly generated |
-| `RAILWAY_PUBLIC_DOMAIN` | Public Railway domain (auto-set) | `localhost` |
-
-<br/>
-
-## 📸 Dashboard Preview
-
-<div align="center">
-
-> Traffic overview • Live connections • Link manager • QR export
-
-<img src="https://img.shields.io/badge/📊_Traffic_Charts-live-2c5364?style=for-the-badge" />
-<img src="https://img.shields.io/badge/🔗_Link_Manager-unlimited-203a43?style=for-the-badge" />
-<img src="https://img.shields.io/badge/📱_QR_Export-per_link-0f2027?style=for-the-badge" />
-
-</div>
-
-<br/>
-
-## 🗺️ Roadmap
-
-- [x] Multi-protocol relay (VLESS, Trojan, Shadowsocks, MTProto)
-- [x] Telegram bot automation
-- [x] Traffic dashboard with charts
-- [ ] Persistent storage (Redis / PostgreSQL)
-- [ ] Multi-node / cluster support
-- [ ] Public REST API for external integrations
-
-<br/>
-
-## 🤝 Contributing
-
-Pull requests are welcome for bug fixes, optimizations, and documentation.
-> ⚠️ Please read the [LICENSE](./LICENSE) before contributing — modification and redistribution of modified versions is restricted. Open an issue first if you'd like to discuss a change.
-
-<br/>
-
-## 📄 License
-
-This project is distributed under a **custom license**:
-✅ Free to use, deploy, and fork
-❌ Modifying and redistributing a modified version is **not permitted**
-
-See the full [LICENSE](./LICENSE) file for details.
-
-<br/>
-
-## ❤️ Support the Project
-
-If this project helped you, consider supporting its development:
-
-<div align="center">
-
-[![Donate](https://img.shields.io/badge/Donate-PayPal-blue.svg?style=for-the-badge&logo=paypal)]([https://your-donate-link.com](https://railwayx3ui.page.gd/wallet/donate.html))
-[![Wallets](https://img.shields.io/badge/Crypto-Wallets-f7931a?style=for-the-badge&logo=bitcoin)]([https://wallets.arvin341az.workers.dev](https://railwayx3ui.page.gd/wallet/donate.html))
-
-**Made with ❤️ by [codebox](https://github.com/arvin341az-glitch)**
-
-</div>
-
-<br/>
-
----
-
-<br/>
-
-<div align="center" dir="rtl">
-<h1>🇮🇷 فارسی</h1>
-</div>
-
-## 📖 فهرست مطالب
-
-- [معرفی](#-معرفی)
-- [ویژگی‌ها](#-ویژگیها)
-- [پروتکل‌های پشتیبانی‌شده](#-پروتکلهای-پشتیبانیشده)
-- [معماری](#-معماری)
-- [ساختار پروژه](#-ساختار-پروژه)
-- [شروع سریع (دیپلوی روی Railway)](#-شروع-سریع-دیپلوی-روی-railway)
-- [توسعه محلی](#-توسعه-محلی)
-- [متغیرهای محیطی](#-متغیرهای-محیطی)
-- [نقشه راه](#-نقشه-راه)
-- [مشارکت](#-مشارکت)
-- [لایسنس](#-لایسنس)
-- [حمایت از پروژه](#-حمایت-از-پروژه)
-
-<br/>
-
-## 🚀 معرفی
-
-**RVG Gateway** یک پنل مدیریت پروکسی چندپروتکلی، سریع و مدرن است که با **Python + FastAPI** ساخته شده و در چند دقیقه روی **Railway** قابل دیپلوی است.
-
-این پروژه یک داشبورد مدیریتی زیبا در اختیارتان می‌گذارد تا لینک‌های پروکسی را در پروتکل‌های مختلف بسازید، مانیتور کنید و مدیریت کنید — همراه با محدودیت ترافیک اختصاصی برای هر لینک، آمار اتصالات زنده و خروجی QR Code، همه از طریق یک سرویس سبک و یکپارچه.
-
-> 💡 این پروژه که ابتدا یک ریلی ساده VLESS روی WebSocket بود، اکنون به یک دروازه کامل چندپروتکلی با احراز هویت، مدیریت سهمیه و رابط کاربری حرفه‌ای تبدیل شده است.
-
-<br/>
-
-## ✨ ویژگی‌ها
-
-<table dir="rtl">
-<tr>
-<td width="50%">
-
-### 🔌 هسته دروازه
-- VLESS روی WebSocket (TLS 443)
-- Trojan، Shadowsocks (AEAD / aes-256-gcm)
-- پروکسی MTProto از طریق باینری `mtg`
-- HTTP Proxy داخلی
-- ترنسپورت‌های xHTTP / gRPC / HTTPUpgrade
-
-</td>
-<td width="50%">
-
-### 📊 داشبورد مدیریتی
-- نمودار ترافیک لحظه‌ای و شاخص‌های روند
-- مانیتورینگ اتصالات زنده
-- ساخت لینک نامحدود با محدودیت ترافیک اختصاصی (MB/GB)
-- فعال/غیرفعال‌سازی آنی هر لینک
-- خروجی QR Code برای هر لینک
-
-</td>
-</tr>
-<tr>
-<td width="50%">
-
-### 🛡️ امنیت و پایداری
-- اعتبارسنجی دقیق UUID
-- احراز هویت مبتنی بر سشن
-- جعل فینگرپرینت TLS (Chrome)
-- بافرهای بهینه‌شده ریلی (۵۱۲ کیلوبایت، `TCP_NODELAY`، `SO_KEEPALIVE`)
-
-</td>
-<td width="50%">
-
-### 🤖 اتوماسیون
-- مدیریت پروکسی یکپارچه با ربات تلگرام
-- پیشنهاد دامنه از طریق Cloudflare Worker
-- ارسال خودکار پروکسی TCP با هدف‌گیری بلک‌لیست
-- دیپلوی با یک کلیک روی Railway
-
-</td>
-</tr>
-</table>
-
-<br/>
-
-## 🌐 پروتکل‌های پشتیبانی‌شده
-
-| پروتکل | ترنسپورت | وضعیت |
-|---|---|:---:|
-| VLESS | WebSocket / xHTTP / gRPC | ✅ |
-| Trojan | WebSocket / HTTPUpgrade | ✅ |
-| Shadowsocks | AEAD (aes-256-gcm) | ✅ |
-| MTProto | `mtg` v2.1.7 | ✅ |
-| HTTP Proxy | داخلی | ✅ |
-
-<br/>
+## ✨ قابلیت‌ها
+
+- 🔐 Setup یک‌باره رمز ادمین در اولین اجرا؛ هیچ رمز پیش‌فرضی وجود ندارد.
+- 🔑 Hash رمز با Argon2id و مهاجرت PBKDF2 برای نصب‌های قدیمی.
+- 🛡️ CSRF Protection برای عملیات تغییر‌دهنده وضعیت.
+- 🚦 Login Rate Limit به‌صورت Per-IP و Global و محدودیت اندازه Request.
+- 🌐 پذیرش `X-Forwarded-For` فقط از Proxyهای مورداعتماد.
+- 🧱 محافظت SSRF شامل آدرس‌های Private/Loopback/Link-local/Multicast/Reserved و شکل‌های خاص IPv4/IPv6.
+- 🔒 IP Pinning پس از DNS Resolve برای کاهش DNS-Rebinding risk.
+- 🚫 HTTP Proxy به‌صورت پیش‌فرض **Fail-Closed** و با Allowlist دامنه/پورت.
+- 🌊 Streaming Proxy با محدودیت اندازه Request/Response.
+- 📏 اعتبارسنجی سخت‌گیرانه VLESS برای Version، UUID، Command، Destination و Port.
+- ♻️ Restore تراکنشی/Atomic برای SQLite.
+- 🗃️ Audit Log و آمار Connection/Traffic.
+- ❤️ Liveness و Readiness Endpoint.
+- 🔐 Backup با Fernet؛ Restore از Backup خام فقط با فعال‌سازی صریح.
+- ⚡ Redis اختیاری برای Session و Login Rate Limit توزیع‌شده.
+- ☁️ Deploy کردن Cloudflare Worker Relay از Dashboard.
+- 🐳 Docker غیر Root و تنظیمات Railway.
+- 🧪 تست‌های امنیتی خودکار.
 
 ## 🏗️ معماری
 
-```mermaid
-flowchart RL
-    A[کلاینت / v2rayNG / NekoBox] -->|VLESS / Trojan / SS| B(RVG Gateway<br/>سرور FastAPI)
-    B --> C{مسیریاب پروتکل}
-    C -->|WebSocket| D[ریلی VLESS / Trojan]
-    C -->|TCP| E[ریلی Shadowsocks]
-    C -->|باینری mtg| F[ریلی MTProto]
-    B --> G[(ذخیره‌سازی درون‌حافظه<br/>لینک و سهمیه)]
-    B --> H[داشبورد مدیریت :8000/dashboard]
-    B --> I[اتوماسیون ربات تلگرام]
-    style B fill:#203a43,stroke:#0f2027,color:#fff
-    style H fill:#2c5364,stroke:#0f2027,color:#fff
+```text
+                         ┌──────────────────────┐
+                         │   داشبورد مدیریت     │
+                         │ login / links / ops  │
+                         └──────────┬───────────┘
+                                    │
+                                    ▼
+┌───────────────┐        ┌──────────────────────┐        ┌────────────────┐
+│ VLESS Clients │───────▶│    Vortex Gateway    │───────▶│ Public targets │
+└───────────────┘   WS   │  Railway / Docker    │ Proxy  └────────────────┘
+                         │ SQLite + optional    │
+                         │ Redis + backups      │
+                         └──────────┬───────────┘
+                                    ▲
+                                    │ relay
+                         ┌──────────┴───────────┐
+                         │ Optional Cloudflare  │
+                         │      Worker          │
+                         └──────────────────────┘
 ```
 
-<br/>
+**Cloudflare Worker فقط Relay است.** منطق VLESS، احراز هویت، Quota، سیاست Proxy و وضعیت Database در Vortex Gateway باقی می‌ماند.
 
-## 📂 ساختار پروژه
+## 📋 پیش‌نیازها
 
-```
-RVG/
-├── protocol/                 # پیاده‌سازی ریلی هر پروتکل
-├── main.py                   # نقطه ورود اپلیکیشن FastAPI
-├── central.py                 # منطق اصلی هماهنگ‌سازی
-├── pages.py                   # هندلر مسیرها/صفحات داشبورد
-├── updater.py                  # منطق به‌روزرسانی خودکار
-├── botgeneratedomin.py         # ربات تلگرام: تولید دامنه
-├── bottokentcpproxy.py         # اتوماسیون پروکسی TCP از طریق تلگرام
-├── zeussocks5.py                # هندلر پروکسی SOCKS5
-├── requirements.txt
-├── .gitignore
-└── README.md
-```
+- Python **3.13** برای توسعه محلی.
+- Docker سازگار با Python 3.13 یا Railway.
+- Storage دائمی برای SQLite در Production.
+- Redis اختیاری برای Session و Login State توزیع‌شده.
 
-<br/>
+## 🚀 اجرای سریع
 
-## ⚡ شروع سریع (دیپلوی روی Railway)
-
-<table dir="rtl">
-<tr>
-<td width="60px" align="center">1️⃣</td>
-<td>
-
-**فورک کردن این ریپازیتوری**
-
-```
-https://github.com/arvin341az-glitch/RVG/fork
-```
-
-</td>
-</tr>
-<tr>
-<td align="center">2️⃣</td>
-<td>
-
-**دیپلوی روی Railway**
-
-۱. وارد [Railway.app](https://railway.app) شوید
-۲. روی **New Project → Deploy from GitHub repo** کلیک کنید
-۳. ریپازیتوری فورک‌شده خود را انتخاب کنید
-۴. Railway به‌صورت خودکار پروژه را می‌سازد و دیپلوی می‌کند 🎉
-
-</td>
-</tr>
-<tr>
-<td align="center">3️⃣</td>
-<td>
-
-**فعال‌سازی دامنه عمومی**
-
-Railway ← Settings ← Networking ← **Generate Domain**
-(این کار متغیر `RAILWAY_PUBLIC_DOMAIN` را خودکار تنظیم می‌کند)
-
-</td>
-</tr>
-<tr>
-<td align="center">4️⃣</td>
-<td>
-
-**باز کردن داشبورد**
-
-```
-https://your-app.up.railway.app/dashboard
-```
-
-لینک پیش‌فرض VLESS را کپی کرده و در کلاینت دلخواه (v2rayNG، NekoBox، Streisand و...) وارد کنید.
-
-</td>
-</tr>
-</table>
-
-<br/>
-
-## 💻 توسعه محلی
+### نصب
 
 ```bash
-# کلون کردن فورک شما
-git clone https://github.com/<your-username>/RVG.git
-cd RVG
+git clone <YOUR-REPOSITORY-URL>
+cd vortex-gateway-4.1-hardened
+python -m venv .venv
+```
 
-# ساخت محیط مجازی
-python -m venv venv
-source venv/bin/activate   # ویندوز: venv\Scripts\activate
+Linux/macOS:
 
-# نصب وابستگی‌ها
+```bash
+source .venv/bin/activate
 pip install -r requirements.txt
+```
 
-# اجرای سرور
+Windows PowerShell:
+
+```powershell
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+### Storage محلی
+
+Default `DB_PATH` برابر `/data/vortex_data.db` است که برای Container/Railway مناسب است. در اجرای محلی مسیر writable محلی تعیین کنید:
+
+PowerShell:
+
+```powershell
+$env:DB_PATH = "$PWD\vortex_data.db"
+$env:LOG_PATH = "$PWD\vortex.log"
+```
+
+Linux/macOS:
+
+```bash
+export DB_PATH="$PWD/vortex_data.db"
+export LOG_PATH="$PWD/vortex.log"
+```
+
+### اجرا
+
+```bash
 python main.py
 ```
 
-داشبورد در آدرس `http://localhost:8000/dashboard` در دسترس خواهد بود.
+سپس:
 
-<br/>
+```text
+http://localhost:8000/login
+```
+
+در اولین اجرا صفحه Setup نمایش داده می‌شود. رمز ادمین باید **حداقل ۴ کاراکتر** باشد؛ هیچ اجباری برای حروف بزرگ/کوچک، عدد یا نماد وجود ندارد.
+
+`ADMIN_PASSWORD` اختیاری است و فقط برای Bootstrap امن‌تر در محیط‌های بدون Volume استفاده می‌شود؛ مقدار آن باید در Secret/Variables سرویس تنظیم شود و هرگز داخل کد commit نشود.
+
+## 🚂 استقرار روی Railway
+
+1. Repository را روی GitHub قرار دهید.
+2. در Railway یک Project از GitHub Repository بسازید.
+3. Build را با `Dockerfile` انجام دهید.
+4. برای استقرار خودکار و جلوگیری از خراب‌شدن رمز/لینک‌ها، بعد از `railway link` اسکریپت `scripts/deploy-railway.ps1` را در Windows یا `scripts/deploy-railway.sh` را در Linux/macOS اجرا کنید؛ اگر Volume مسیر `/data` وجود نداشته باشد خودش آن را می‌سازد و بعد Deploy می‌کند.
+5. اگر از Deploy مستقیم GitHub در داشبورد Railway استفاده می‌کنید، Volume را یک‌بار روی `/data` متصل کنید؛ یک `railway.toml` معمولی نمی‌تواند Volume را در همان Deploy به‌صورت امن قبل از اولین اجرا ایجاد و متصل کند.
+6. تنظیم کنید:
+
+```text
+DB_PATH=/data/vortex_data.db
+```
+
+6. Deploy کنید و `/login` را باز کنید.
+7. Setup رمز ادمین را کامل کنید.
+
+`railway.toml` تنظیمات Docker Build، Readiness و Restart Policy را فراهم می‌کند. Railway معمولاً `PORT` را inject می‌کند.
+
+> ⚠️ بدون Volume دائمی، Redeploy می‌تواند SQLite و در نتیجه Linkها، تنظیمات، Audit History و Hash رمز ادمین را از بین ببرد.
+
+## 🐳 Docker
+
+```bash
+docker build -t vortex-gateway .
+```
+
+اجرای محلی:
+
+```bash
+docker run --rm \
+  -p 8000:8000 \
+  -v "$PWD/data:/data" \
+  -e DB_PATH=/data/vortex_data.db \
+  -e LOG_PATH=/data/vortex.log \
+  vortex-gateway
+```
 
 ## ⚙️ متغیرهای محیطی
 
-| متغیر | توضیح | پیش‌فرض |
-|---|---|---|
-| `PORT` | پورت اجرای سرویس | `8000` |
-| `SECRET_KEY` | کلید امنیتی داخلی | تولید تصادفی |
-| `RAILWAY_PUBLIC_DOMAIN` | دامنه عمومی Railway (خودکار) | `localhost` |
+این جدول با Defaultهای فعلی کد هماهنگ است.
 
-<br/>
+| متغیر | پیش‌فرض | کاربرد |
+|---|---|---|
+| `PORT` | `8000` | پورت HTTP؛ Railway معمولاً آن را تعیین می‌کند. |
+| `RAILWAY_PUBLIC_DOMAIN` | `localhost` | Host عمومی برای ساخت Linkها؛ `https://` وارد نکنید. |
+| `DB_PATH` | `/data/vortex_data.db` | مسیر SQLite. |
+| `LOG_PATH` | `vortex.log` | مسیر Log چرخشی. |
+| `TRUST_PROXY` | `0` | اعتماد به Forwarding Headerها فقط با فعال‌سازی صریح. |
+| `TRUSTED_PROXY_CIDRS` | خالی | شبکه‌های Proxy مورداعتماد؛ با `TRUST_PROXY=1` لازم است. |
+| `SESSION_SECRET` | خالی | وقتی `REDIS_URL` فعال است اجباری؛ راز تصادفی پایدار برای هماهنگی CSRF بین Replicaها. |
+| `REQUIRE_PERSISTENT_VOLUME` | `0` | اگر روی `1` باشد، در Railway بدون Volume واقعی برنامه متوقف می‌شود؛ `0` اجازه می‌دهد بدون Volume اجرا شود و `/data` را موقتاً استفاده کند. برای داده دائمی، Volume در `/data` توصیه می‌شود. |
+| `BACKUP_ENCRYPTION_KEY` | خالی | Fernet Key برای Backup رمزدار. |
+| `ALLOW_PLAINTEXT_BACKUP` | `0` | فعال‌سازی Restore از Backup خام/قدیمی. |
+| `ALLOW_LEGACY_SUBSCRIPTION_UUID` | `0` | پذیرش موقت Subscription URL قدیمی مبتنی بر UUID. |
+| `PROXY_ALLOWED_DOMAINS` | خالی | Allowlist مقصدهای HTTP Proxy، مانند `example.com` یا `*.example.org`. |
+| `PROXY_REQUIRE_ALLOWLIST` | `1` | با فعال بودن، Proxy بدون Allowlist رد می‌شود. |
+| `PROXY_ALLOWED_PORTS` | `80,443,8080,8443` | Portهای مجاز HTTP Proxy خروجی. |
+| `TUNNEL_ALLOWED_PORTS` | `80,443,8080,8443` | Portهای مجاز مقصد VLESS. |
+| `PROXY_MAX_RESPONSE_BYTES` | `52428800` | حداکثر Response Proxy، برابر 50 MiB. |
+| `PROXY_MAX_URL_LENGTH` | `8192` | حداکثر طول URL Proxy. |
+| `MAX_HTTP_BODY_BYTES` | `2097152` | حداکثر Body کنترل‌پلین، برابر 2 MiB. |
+| `MAX_LOGIN_BODY_BYTES` | `16384` | حداکثر Body برای Login/Setup. |
+| `MAX_WS_INITIAL_BYTES` | `16384` | حداکثر Frame اولیه VLESS WebSocket. |
+| `MAX_CONNECTIONS_GLOBAL` | `500` | سقف Connection همزمان کل. |
+| `MAX_CONNECTIONS_PER_IP` | `25` | سقف Connection همزمان برای هر IP. |
+| `MAX_CONNECTIONS_PER_LINK` | `50` | سقف Connection همزمان برای هر Link. |
+| `AUTO_BACKUP_INTERVAL_HOURS` | `24` | فاصله Backup خودکار؛ `<=0` برای غیرفعال کردن. |
+| `AUTO_BACKUP_KEEP` | `7` | تعداد Backupهای خودکار نگهداری‌شده. |
+| `AUTO_BACKUP_DIR` | `/data/backups` | مسیر Backupهای خودکار. |
+| `TELEGRAM_BOT_TOKEN` | خالی | Token اختیاری Telegram Bot. |
+| `TELEGRAM_CHAT_ID` | خالی | Chat ID مقصد Telegram. |
+
+### متغیر پشتیبانی‌نشده
+
+`ADMIN_PASSWORD` اختیاری است؛ اگر در Railway به‌صورت Secret/Variable تنظیم شود، در اولین اجرای دیتابیس بدون رمز، فقط hash آن با Argon2id ذخیره می‌شود. در Production اتصال Volume به `/data` روش اصلی است. روی Railway، در حالت پیش‌فرض `REQUIRE_PERSISTENT_VOLUME=0` است؛ بنابراین برنامه بدون Volume هم بالا می‌آید، اما داده‌های `/data` روی storage موقت قرار می‌گیرند و ممکن است با Redeploy/تعویض Container از بین بروند. برای داده دائمی، `REQUIRE_PERSISTENT_VOLUME=1` و Volume واقعی روی `/data` را تنظیم کنید.
+
+## 💾 Backup و Restore
+
+ساخت Fernet Key:
+
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+سپس به‌عنوان Secret ذخیره کنید:
+
+```text
+BACKUP_ENCRYPTION_KEY=<generated-key>
+```
+
+کلید را کنار Backupها ذخیره نکنید. از دست دادن آن یعنی Backup رمزنگاری‌شده قابل Restore نخواهد بود.
+
+Backupهای خودکار قبل از نصب نهایی فایل، رمزنگاری و Atomic ذخیره می‌شوند. Restore از Backup خام فقط با `ALLOW_PLAINTEXT_BACKUP=1` فعال می‌شود.
+
+## 🛡️ امنیت HTTP Proxy
+
+Proxy در Dashboard احراز هویت می‌شود و عملیات تغییر‌دهنده وضعیت به CSRF Token نیاز دارند. مقصدهای خروجی تحت SSRF Check و IP Pinning قرار می‌گیرند.
+
+پیش‌فرض:
+
+```text
+PROXY_REQUIRE_ALLOWLIST=1
+```
+
+پس Allowlist خالی یعنی **Proxy غیرفعال و Fail-Closed**.
+
+اگر عمداً `PROXY_REQUIRE_ALLOWLIST=0` را فعال کنید، Proxy می‌تواند به مقصدهایی که SSRF Check و Port Policy را پاس می‌کنند متصل شود. فقط در صورت نیاز عملیاتی مشخص از این حالت استفاده کنید.
+
+## ☁️ Cloudflare Worker Relay
+
+Dashboard می‌تواند یک Relay اختیاری Cloudflare Worker ایجاد کند.
+
+```text
+Client → Cloudflare Worker → Vortex Gateway → destination
+```
+
+Worker جایگزین Gateway نیست؛ درخواست را به Origin عمومی Vortex Forward می‌کند و منطق VLESS/Authentication در Gateway باقی می‌ماند.
+
+Endpoint استقرار، Cloudflare API Token را فقط در Request احراز‌هویت‌شده دریافت می‌کند، آن را validate می‌کند و Account را پیدا می‌کند. Token در Database ذخیره نمی‌شود. Deployهای بعدی ترجیحاً همان Worker Name قبلی را به‌روزرسانی می‌کنند تا URL و لینک‌های موجود ثابت بمانند. پنل همچنین Health Check واقعی، زمان آخرین Deploy/Check، تغییر Custom Domain، غیرفعال‌سازی و حذف کامل Worker را ارائه می‌دهد.
+
+برای این قابلیت Gateway باید از اینترنت عمومی قابل دسترسی باشد؛ localhost نمی‌تواند Origin Worker باشد.
+
+## 🔌 APIها
+
+### عمومی / Health
+
+- `GET /` — Metadata سرویس.
+- `GET /health` — وضعیت کلی.
+- `GET /health/live` — Liveness.
+- `GET /health/ready` — Readiness شامل Integrity SQLite و در صورت وجود Redis Connectivity.
+- `GET /sub/{subscription_token}` — Subscription.
+- `WS /tunnel/{uuid}` — VLESS WebSocket Tunnel.
+
+### Authentication / Setup
+
+- `GET /api/setup-status`
+- `POST /api/setup-password`
+- `POST /api/login`
+- `POST /api/logout`
+- `GET /api/me`
+- `POST /api/change-password`
+
+### Dashboard / Operations
+
+- `GET /api/system/status`
+- `POST /api/system/storage-test`
+- `GET /api/stats`
+- `GET /api/audit`
+- `GET /api/connections`
+- `POST /api/notify/test`
+- `POST /api/cloudflare/deploy-worker`
+- `GET /api/cloudflare/status` — Health check واقعی Worker و آخرین Deploy/Check.
+- `POST /api/cloudflare/domains` — فهرست Custom Domainهای قابل استفاده برای Token.
+- `POST /api/cloudflare/domain` — تغییر/اتصال دامنه یا زیردامنه Worker.
+- `POST /api/cloudflare/disable-worker` — غیرفعال‌سازی دسترسی Worker بدون حذف اسکریپت.
+- `POST /api/cloudflare/delete-worker` — حذف کامل Worker و Binding دامنه.
+
+### Links / Backup
+
+- `GET /api/links`
+- `POST /api/links`
+- `PATCH /api/links/{uid}`
+- `DELETE /api/links/{uid}`
+- `GET /api/links/{uid}/traffic`
+- `GET /api/backup`
+- `POST /api/backup/restore`
+
+### Proxy احراز‌هویت‌شده
+
+- `GET|POST|PUT|DELETE|PATCH|HEAD /api/proxy/{target_url}`
+
+## 🧩 Redis و چند Instance
+
+با `REDIS_URL`، Redis برای **Sessionهای توزیع‌شده و Login Rate Limiting** استفاده می‌شود.
+
+SQLite همچنان منبع اصلی داده‌های Link و Stateهای دائمی است؛ بنابراین این Release از نظر Database-backed state هنوز عمدتاً **Single-Instance** است. چند Instance با SQLite جایگزین یک Database واقعی Multi-Writer نمی‌شود.
+
+برای Scale افقی واقعی، PostgreSQL گزینه طبیعی مرحله بعد است و Redis می‌تواند Stateهای موقت/توزیع‌شده را مدیریت کند.
+
+## 🔒 TLS و Reverse Proxy
+
+برنامه خودش TLS را Terminate نمی‌کند. در Production این کار را در Railway، Reverse Proxy یا Load Balancer انجام دهید.
+
+فقط وقتی واقعاً پشت Proxy مورداعتماد هستید تنظیم کنید:
+
+```text
+TRUST_PROXY=1
+```
+
+و شبکه‌های دقیق Proxy را در `TRUSTED_PROXY_CIDRS` مشخص کنید.
+
+## 🧪 تست‌ها
+
+پروژه از `unittest` استاندارد Python استفاده می‌کند و به `pytest` نیاز ندارد:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+CI فایل‌های Python را بدون تولید Bytecode Parse می‌کند. اجرای مشابه محلی:
+
+```bash
+python - <<'PY'
+import ast
+from pathlib import Path
+for path in Path('.').rglob('*.py'):
+    if any(part in {'.git', '.venv', 'venv', '__pycache__'} for part in path.parts):
+        continue
+    ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+print('Python syntax: OK')
+PY
+```
+
+CI همچنین `pip check` را اجرا و نبود Artifactهای Bytecode را بررسی می‌کند.
+
+## 📁 ساختار پروژه
+
+```text
+vortex-gateway-4.1-hardened/
+├── main.py
+├── templates.py
+├── requirements.txt
+├── .env.example
+├── Dockerfile
+├── .dockerignore
+├── railway.toml
+├── README.md
+├── README_EN.md
+├── SECURITY.md
+├── CHANGELOG.md
+├── .github/
+│   └── workflows/
+│       └── ci.yml
+└── tests/
+    ├── __init__.py
+    ├── test_security.py
+    └── test_hardening.py
+```
+
+## 🔐 راهنمای امنیتی
+
+قبل از Public کردن Repository:
+
+- هرگز `.env`، SQLite DB، Log، Backup، Credential یا API Token را commit نکنید.
+- `BACKUP_ENCRYPTION_KEY` واقعی را در Issue، PR، README یا Commit Message قرار ندهید.
+- Subscription URLها را Credential در نظر بگیرید.
+- در Production از Storage دائمی برای SQLite استفاده کنید.
+- HTTP Proxy را تا زمانی که Allowlist و نیاز عملیاتی مشخص ندارید Fail-Closed نگه دارید.
+- از یک رمز ادمین طولانی و یکتا استفاده کنید و در صورت افشا فوراً آن را تغییر دهید.
+
+جزئیات اختصاصی در [SECURITY.md](SECURITY.md) آمده است.
 
 ## 🗺️ نقشه راه
 
-- [x] ریلی چندپروتکلی (VLESS، Trojan، Shadowsocks، MTProto)
-- [x] اتوماسیون ربات تلگرام
-- [x] داشبورد ترافیک با نمودار
-- [ ] ذخیره‌سازی دائمی (Redis / PostgreSQL)
-- [ ] پشتیبانی چندنودی / کلاستر
-- [ ] API عمومی REST برای یکپارچه‌سازی با سرویس‌های دیگر
+- PostgreSQL برای State دائمی و Multi-Instance واقعی.
+- مدیریت توزیع‌شده Quota/Connection با Redis.
+- Prometheus Metrics.
+- تست‌های End-to-End برای WebSocket و HTTP Proxy.
+- Modular کردن `main.py` به auth/proxy/tunnel/database.
+- Static Analysis/Linting و Vulnerability Check برای Dependencyها در CI.
 
-<br/>
+## 📄 مجوز
 
-## 🤝 مشارکت
+در Repository فعلی License وجود ندارد. بدون افزودن License صریح، کاربران نباید فرض کنند که اجازه Copy، Modify یا Redistribute پروژه را دارند.
 
-پول‌ریکوئست برای رفع باگ، بهینه‌سازی و مستندسازی خوش‌آمد است.
-> ⚠️ لطفاً قبل از مشارکت، فایل [LICENSE](./LICENSE) را مطالعه کنید — تغییر و بازنشر نسخه تغییریافته محدود شده است. برای هرگونه تغییر، ابتدا یک Issue باز کنید.
+---
 
-<br/>
+## English documentation
 
-## 📄 لایسنس
-
-این پروژه تحت یک **لایسنس سفارشی** منتشر شده است:
-✅ استفاده، دیپلوی و فورک آزاد
-❌ تغییر و بازنشر نسخه تغییریافته **مجاز نیست**
-
-برای جزئیات کامل به فایل [LICENSE](./LICENSE) مراجعه کنید.
-
-<br/>
-
-## ❤️ حمایت از پروژه
-
-اگر این پروژه به شما کمک کرد، می‌توانید از توسعه آن حمایت کنید:
-
-<div align="center">
-
-[![Donate](https://img.shields.io/badge/Donate-PayPal-blue.svg?style=for-the-badge&logo=paypal)]([https://your-donate-link.com](https://railwayx3ui.page.gd/wallet/donate.html))
-[![Wallets](https://img.shields.io/badge/Crypto-Wallets-f7931a?style=for-the-badge&logo=bitcoin)]([https://wallets.arvin341az.workers.dev](https://railwayx3ui.page.gd/wallet/donate.html))
-
-**ساخته‌شده با ❤️ توسط [codebox](https://github.com/arvin341az-glitch)**
-
-</div>
-
-<br/>
-
-<img src="https://capsule-render.vercel.app/api?type=waving&color=0:2c5364,50:203a43,100:0f2027&height=120&section=footer" width="100%"/>
+نسخه کامل انگلیسی در [README_EN.md](README_EN.md) قرار دارد.

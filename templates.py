@@ -448,12 +448,24 @@ button{cursor:pointer}
 .toast.show{opacity:1;transform:none}
 .toast.err{background:#3a1518;border-color:rgba(248,113,113,.4)}
 
+.update-banner{display:none;align-items:center;justify-content:center;gap:12px;flex-wrap:wrap;
+  background:linear-gradient(90deg,var(--accent-soft),var(--surface2));border-bottom:1px solid var(--accent);
+  padding:10px 16px;font-size:11.5px;color:var(--text);position:sticky;top:0;z-index:60}
+.update-banner.show{display:flex}
+.update-banner b{color:var(--accent)}
+.update-banner .btn{padding:7px 14px;font-size:11px}
+
 @media(max-width:1100px){.app{grid-template-columns:86px minmax(0,1fr)}.sidebar{padding:18px 10px}.brand{justify-content:center;padding-left:0;padding-right:0}.brand-name,.brand-caption,.nav-label,.tb-tab span,.system span,.logout span{display:none}.tb-tab{justify-content:center}.tb-tab .chip{display:none}.overview-intro,.workbench{grid-template-columns:1fr}.link-layout{grid-template-columns:1fr}.create-panel{position:relative;top:auto}.settings-layout{grid-template-columns:1fr}.settings-nav{display:flex;gap:5px;overflow:auto}.settings-nav button{white-space:nowrap;width:auto}.settings-content{grid-template-columns:1fr}}
 @media(max-width:720px){.app{display:block}.sidebar{position:fixed;right:0;left:0;top:0;bottom:auto;height:64px;width:100%;padding:7px 14px;flex-direction:row;align-items:center;border-left:0;border-bottom:1px solid var(--line)}.brand{border:0;padding:0;flex:1;justify-content:flex-start}.brand-name,.brand-caption{display:block}.brand-name{font-size:12px}.brand-mark{width:34px;height:34px}.menu-toggle{display:flex}.sidebar-menu{position:fixed;top:64px;right:0;left:0;max-height:calc(100vh - 64px);overflow:auto;background:var(--bg2);border-bottom:1px solid var(--line);box-shadow:0 20px 40px -20px rgba(0,0,0,.5);padding:4px 15px 18px;transform-origin:top;transform:scaleY(0);opacity:0;pointer-events:none;transition:transform .18s ease,opacity .18s ease;z-index:49;display:block}.sidebar-menu.open{transform:scaleY(1);opacity:1;pointer-events:auto}.sidebar-menu .nav-label{display:block}.tb-tabs{flex-direction:column;gap:3px}.tb-tab{justify-content:flex-start;padding:11px 12px}.tb-tab span{display:inline}.tb-tab .chip{display:inline-block}.sidebar-foot{display:block;margin-top:14px;padding-top:14px}.system span,.logout span{display:inline}.main{padding-top:64px}.topbar{height:64px;padding:0 15px}.top-pill{display:none}.stage{padding:22px 15px 40px}.page-title{font-size:21px}.signal-row{grid-template-columns:1fr 1fr}.signal:nth-child(2){border-right:0}.signal:nth-child(n+3){border-top:1px solid var(--line)}.intro-copy h1{font-size:26px}.create-grid{grid-template-columns:1fr}.create-grid .wide{grid-column:auto}.list-tools{display:block}.filter-row{margin-bottom:8px;flex-wrap:wrap}.filter-row input{min-width:100%}.clean-page{padding:15px}.conn-row{flex-wrap:wrap}.settings-content{display:block}.setting-section{margin-bottom:14px}}
 </style>
 </head>
 <body>
 <div class="toast" id="toast"></div>
+<div class="update-banner" id="updateBanner">
+  <i class="ti ti-arrow-big-up-lines"></i>
+  <span>یک بروزرسانی جدید (<b id="updateVersionText"></b>) در دسترس است</span>
+  <button class="btn btn-grad" id="applyUpdateBtn"><i class="ti ti-download"></i> بروزرسانی</button>
+</div>
 <div class="app">
   <aside class="sidebar">
     <div class="brand">
@@ -607,6 +619,7 @@ button{cursor:pointer}
               <div id="cfWorkerInfo" style="display:none;margin-top:12px;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--bg2);font-size:11px;line-height:2"></div>
             </section>
             <section class="setting-section"><h3>بکاپ و بازیابی</h3><p>از تنظیمات و لینک‌ها نسخه پشتیبان بگیر یا یک فایل قبلی را برگردان.</p><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-grad" id="downloadBackupBtn"><i class="ti ti-download"></i> دریافت بکاپ</button><button class="btn" id="restoreFileBtn"><i class="ti ti-upload"></i> بازیابی</button><input type="file" id="restoreFile" accept=".vortex,application/octet-stream" style="display:none"></div></section>
+            <section class="setting-section"><h3>بروزرسانی نرم‌افزار</h3><p>نسخه فعلی: <b id="settingsCurrentVersion" style="font-family:var(--f-mono)">—</b><br>پنل به‌صورت خودکار Commit جدید مخزن گیت‌هاب پروژه را چک می‌کند. وقتی چیزی جدید پیدا شود، همینجا و در بالای صفحه اطلاع داده می‌شود و فقط کافیست دکمه‌ی «بروزرسانی» را بزنی.</p><div id="updateStatusBox" style="font-size:10.5px;color:var(--text-dim);margin-bottom:12px">در حال بررسی...</div><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-grad" id="settingsApplyUpdateBtn" style="display:none"><i class="ti ti-download"></i> بروزرسانی</button></div></section>
             <section class="setting-section wide"><h3>اعلان تلگرام</h3><p>وضعیت اتصال و ارسال پیام تست را از این بخش کنترل کن.</p><div class="mini-stat" style="max-width:520px"><span>وضعیت اتصال</span><strong id="telegramStatus">—</strong></div><button class="btn" id="sendTestNotifBtn" style="margin-top:12px"><i class="ti ti-send"></i> ارسال پیام تست</button></section>
             <section class="setting-section wide"><h3>مسدودسازی تبلیغات</h3><p>وقتی فعال باشد، مقصدهای شناخته‌شده‌ی تبلیغاتی/ردیاب (مثل شبکه‌های تبلیغاتی و آنالیتیکس پراستفاده) پیش از اتصال، مستقیم توسط گیت‌وی بسته می‌شوند — روی همه‌ی کانفیگ‌های VLESS به‌صورت یکجا اثر می‌گذارد.</p>
               <div class="mini-stat" style="max-width:520px;margin-bottom:12px"><span>وضعیت</span><button class="toggle" id="adsBlockToggle" title="فعال / غیرفعال"></button></div>
@@ -1248,6 +1261,74 @@ async function restoreBackup(evt){
   }
 }
 
+// ───────────────────────── بروزرسانی نرم‌افزار ─────────────────────────
+let _updateApplying = false;
+
+function _renderUpdateState(d){
+  const currentEl = document.getElementById('settingsCurrentVersion');
+  if(currentEl && d.current_version) currentEl.textContent = d.current_version;
+  const banner = document.getElementById('updateBanner');
+  const box = document.getElementById('updateStatusBox');
+  const settingsBtn = document.getElementById('settingsApplyUpdateBtn');
+  if(d.available){
+    document.getElementById('updateVersionText').textContent = d.new_sha || '';
+    banner.classList.add('show');
+    const msg = d.message ? ('<br>'+escapeHtml(d.message)) : '';
+    if(box) box.innerHTML = 'یک Commit جدید (<b style="color:var(--accent)">'+escapeHtml(d.new_sha||'')+'</b>) روی گیت‌هاب پیدا شد و آماده اعمال است.'+msg;
+    if(settingsBtn) settingsBtn.style.display = '';
+  } else {
+    banner.classList.remove('show');
+    if(box) box.textContent = 'در حال حاضر آپدیت جدیدی موجود نیست.';
+    if(settingsBtn) settingsBtn.style.display = 'none';
+  }
+}
+
+async function checkForUpdate(){
+  try{
+    const r = await apiFetch('/api/updates/status');
+    if(!r.ok) return;
+    _renderUpdateState(await r.json());
+  }catch(e){}
+}
+
+async function applyUpdate(){
+  if(_updateApplying) return;
+  if(!confirm('پنل بروزرسانی می‌شود و برای چند ثانیه از دسترس خارج می‌شود. ادامه می‌دهید؟')) return;
+  _updateApplying = true;
+  const btns = [document.getElementById('applyUpdateBtn'), document.getElementById('settingsApplyUpdateBtn')].filter(Boolean);
+  btns.forEach(b=>{ b.disabled = true; });
+  toast('در حال اعمال بروزرسانی...');
+  try{
+    const r = await apiFetch('/api/updates/apply', {method:'POST'});
+    const d = await r.json().catch(()=>({}));
+    if(!r.ok){
+      toast(d.detail || 'اعمال بروزرسانی ناموفق بود', true);
+      _updateApplying = false;
+      btns.forEach(b=>{ b.disabled = false; });
+      return;
+    }
+    toast('بروزرسانی در حال اعمال است؛ پنل چند ثانیه دیگر دوباره در دسترس خواهد بود...');
+    _waitForRestartThenReload();
+  }catch(e){
+    toast('خطا در ارتباط با سرور', true);
+    _updateApplying = false;
+    btns.forEach(b=>{ b.disabled = false; });
+  }
+}
+
+function _waitForRestartThenReload(){
+  // پردازه در حال ری‌استارت است؛ هر ۲ ثانیه یک‌بار health-check می‌زنیم
+  // و به‌محض بازگشت سرویس، صفحه را رفرش می‌کنیم.
+  setTimeout(function poll(){
+    fetch('/health/live', {cache:'no-store'}).then(r=>{
+      if(r.ok) location.reload(); else setTimeout(poll, 2000);
+    }).catch(()=> setTimeout(poll, 2000));
+  }, 2500);
+}
+
+document.getElementById('applyUpdateBtn').addEventListener('click', applyUpdate);
+document.getElementById('settingsApplyUpdateBtn').addEventListener('click', applyUpdate);
+
 let cloudflareConfigured = false;
 function applyCloudflareAvailability(){
   [document.getElementById('newRouteVia'), document.getElementById('editRouteVia')].forEach(sel=>{
@@ -1360,8 +1441,10 @@ document.getElementById('setupDoneBtn').addEventListener('click', async()=>{
   await loadCloudflareStatus();
   await loadAdsBlockSettings();
   await refreshAll();
+  await checkForUpdate();
   setInterval(refreshAll, 8000);
   setInterval(loadAdsBlockSettings, 15000);
+  setInterval(checkForUpdate, 60000);
   // وضعیت Worker کلادفلر (سالم/ناسالم/latency) را خودکار و دوره‌ای تازه نگه
   // می‌دارد تا کاربر مجبور نباشد برای دیدن نتیجه‌ی واقعی بعد از دیپلوی/تغییر
   // دامنه، دستی روی «بررسی وضعیت» کلیک کند یا کل صفحه را رفرش کند.
