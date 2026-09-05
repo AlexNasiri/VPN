@@ -1230,7 +1230,7 @@ def _maybe_schedule_quota_alert(uid: str, label: str, pct: float):
         return
     _notified_pct[uid] = crossed
     emoji = "🛑" if crossed >= 100 else "⚠️"
-    text = f"{emoji} Vortex Gateway\nلینک «{label}» به {crossed}٪ از سقف ترافیک خود رسید."
+    text = f"{emoji} Gateway\nلینک «{label}» به {crossed}٪ از سقف ترافیک خود رسید."
     if crossed >= 100:
         text += "\nاین لینک تا بازنشانی/افزایش سقف، مسدود شده است."
     asyncio.create_task(send_telegram_message(text))
@@ -1650,7 +1650,7 @@ async def lifespan(_app: FastAPI):
     panel_host = get_host()
     display_host = f"{panel_host}" if cookie_secure() else f"{panel_host}:{CONFIG['port']}"
     panel_url = f"{scheme}://{display_host}/login"
-    logger.info("🌀 پنل Vortex در آدرس زیر در دسترس است: %s", panel_url)
+    logger.info("🌀 پنل در آدرس زیر در دسترس است: %s", panel_url)
 
     limits = httpx.Limits(max_connections=300, max_keepalive_connections=50)
     timeout = httpx.Timeout(20.0, connect=8.0)
@@ -1704,7 +1704,7 @@ def _link_route_via(uid: str) -> str:
     return value if value in ("auto", "railway", "cloudflare") else "auto"
 
 
-def generate_vless_link(uid: str, host: str, remark: str = "Vortex") -> str:
+def generate_vless_link(uid: str, host: str, remark: str = "") -> str:
     route_via = _link_route_via(uid)
     worker_parts = _worker_endpoint_parts() if route_via != "railway" else None
     if worker_parts:
@@ -2998,7 +2998,7 @@ async def list_connections(_=Depends(require_auth)):
 async def send_test_notification(_=Depends(require_auth_csrf)):
     if not (CONFIG["telegram_bot_token"] and CONFIG["telegram_chat_id"]):
         raise HTTPException(status_code=400, detail="TELEGRAM_BOT_TOKEN یا TELEGRAM_CHAT_ID تنظیم نشده است")
-    ok = await send_telegram_message("✅ Vortex Gateway: این یک پیام تستی است. اعلان‌ها درست کار می‌کنند.")
+    ok = await send_telegram_message("✅ Gateway: این یک پیام تستی است. اعلان‌ها درست کار می‌کنند.")
     if not ok:
         raise HTTPException(status_code=502, detail="ارسال پیام تلگرام ناموفق بود؛ توکن/chat_id را بررسی کنید")
     return {"ok": True}
@@ -3115,7 +3115,7 @@ async def create_link(payload: LinkCreateRequest, request: Request, _=Depends(re
         "expires_at": expires_at,
         "speed_limit_bps": speed_limit_bps,
         "route_via": payload.route_via,
-        "vless_link": generate_vless_link(uid, host, remark=f"Vortex-{label}"),
+        "vless_link": generate_vless_link(uid, host, remark=f"{label}"),
         "sub_link": generate_sub_url(uid, host),
     }
 
@@ -3137,7 +3137,7 @@ async def list_links(_=Depends(require_auth)):
                 "speed_limit_bps": data.get("speed_limit_bps", 0),
                 "expired": is_link_expired(data),
                 "route_via": data.get("route_via") or "railway",
-                "vless_link": generate_vless_link(uid, host, remark=f"Vortex-{data['label']}"),
+                "vless_link": generate_vless_link(uid, host, remark=f"{data['label']}"),
                 "sub_link": generate_sub_url(uid, host),
             })
     result.sort(key=lambda x: x["created_at"], reverse=True)
@@ -4342,7 +4342,7 @@ async def subscription_page(token: str, request: Request):
         )
 
     host = get_host()
-    vless_link = generate_vless_link(uid, host, remark=f"Vortex-{snapshot['label']}")
+    vless_link = generate_vless_link(uid, host, remark=f"{snapshot['label']}")
     sub_link = generate_sub_url(uid, host)
     expired = is_link_expired(snapshot)
 
