@@ -6,6 +6,8 @@
 # + کش سراسری برای مانیفست تا صرف‌نظر از تعداد کاربران پنل، فشار درخواست به
 #   سرور Worker ثابت و کم بماند (Cloudflare Workers هم سقف رایگان دارن،
 #   پس این کش هنوز لازمه)
+# + لیست فایل‌های محافظت‌شده (EXCLUDED_UPDATE_FILES): این فایل‌ها حتی اگر در
+#   مانیفست Worker هم باشن، هیچ‌وقت هنگام آپدیت بازنویسی نمی‌شن.
 import asyncio, os, time, traceback, re, json, hashlib
 from pathlib import Path
 from collections import deque
@@ -30,6 +32,43 @@ BRANCH = "cf-worker-manifest"
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 HISTORY_FILE = DATA_DIR / "update_history.json"
+
+# ── فایل‌های محافظت‌شده در برابر آپدیت ────────────────────────────────────────
+# این‌ها با «مسیر نسبی به APP_DIR» مقایسه می‌شن (نه فقط اسم فایل)، تا مثلاً
+# یک فایل دیگه به اسم مشابه در ساب‌فولدر اشتباهی فیلتر نشه. مقایسه بعد از
+# نرمالایز کردن اسلش‌ها و lower-case انجام می‌شه تا با ورودی‌های مختلف مانیفست
+# (./main.py یا main.py) هم مچ بشه.
+#
+# می‌تونید این لیست رو با متغیر محیطی EXTRA_EXCLUDED_UPDATE_FILES (با کاما
+# جدا شده) گسترش بدید، بدون این‌که مجبور باشید کد رو دست بزنید.
+EXCLUDED_UPDATE_FILES = {
+    "main.py",
+    "templates.py",
+    "updater.py",
+}
+_extra = os.environ.get("EXTRA_EXCLUDED_UPDATE_FILES", "")
+if _extra:
+    EXCLUDED_UPDATE_FILES |= {p.strip() for p in _extra.split(",") if p.strip()}
+
+
+def _normalize_rel_path(rel: str) -> str:
+    return rel.strip().lstrip("./").replace("\\", "/").lower()
+
+
+def _is_excluded_path(rel: str) -> bool:
+    """True اگه مسیر نسبی (rel) با یکی از فایل‌های محافظت‌شده مطابقت داشته باشه.
+    هم مطابقت کامل مسیر رو چک می‌کنه (برای مسیرهای تودرتو مثل app/main.py)
+    و هم مطابقت فقط با اسم فایل در ریشه (برای main.py، template.py، updater.py)."""
+    norm = _normalize_rel_path(rel)
+    if not norm:
+        return False
+    basename = norm.rsplit("/", 1)[-1]
+    for excluded in EXCLUDED_UPDATE_FILES:
+        excluded_norm = _normalize_rel_path(excluded)
+        if norm == excluded_norm or basename == excluded_norm:
+            return True
+    return False
+
 
 update_log: deque = deque(maxlen=300)
 update_state = {"running": False, "progress": 0}
@@ -252,12 +291,19 @@ def _save_update_history_entry(entry: dict):
 
 async def _download_one_file(client: httpx.AsyncClient, entry: dict) -> tuple[bool, str]:
     """یک فایل از مانیفست رو دانلود و روی دیسک (APP_DIR/path) می‌نویسه.
-    خروجی: (موفق؟, پیام خطا در صورت شکست)"""
+    خروجی: (موفق؟, پیام خطا در صورت شکست)
+    اگه مسیر فایل جزو EXCLUDED_UPDATE_FILES باشه، اصلاً دانلود/نوشته نمی‌شه
+    (skip امن — نه خطا، چون این یه رفتار عمدیه نه شکست)."""
     rel = entry.get("path", "").lstrip("/")
     url = entry.get("url", "")
     expected_sha1 = entry.get("sha1")
     if not rel or not url:
         return False, "ورودی مانیفست ناقص است (path/url خالی)"
+
+    if _is_excluded_path(rel):
+        _log(f"⏭️ رد شد (فایل محافظت‌شده، آپدیت نمی‌شود): {rel}")
+        return True, ""  # موفق در نظر گرفته می‌شه چون رد کردنش عمدیه، نه شکست
+
     # جلوگیری از path traversal (../ در مسیر فایل)
     target = (APP_DIR / rel).resolve()
     if not str(target).startswith(str(APP_DIR.resolve())):
@@ -280,11 +326,13 @@ async def _download_one_file(client: httpx.AsyncClient, entry: dict) -> tuple[bo
 
 
 async def perform_update() -> bool:
-    """مانیفست Worker رو می‌گیره، فایل‌های لیست‌شده رو دانلود و جایگزین می‌کنه،
-    و در پایان version.txt محلی رو با نسخه‌ی جدید بروزرسانی می‌کنه."""
+    """مانیفست Worker رو می‌گیره، فایل‌های لیست‌شده رو دانلود و جایگزین می‌کنه
+    (به‌جز فایل‌های محافظت‌شده در EXCLUDED_UPDATE_FILES)، و در پایان
+    version.txt محلی رو با نسخه‌ی جدید بروزرسانی می‌کنه."""
     update_state["running"] = True
     update_state["progress"] = 1
     _log(f"شروع بروزرسانی | MANIFEST={UPDATE_MANIFEST_URL or 'خالی!'} | APP_DIR={APP_DIR}")
+    _log(f"فایل‌های محافظت‌شده (هرگز آپدیت نمی‌شوند): {', '.join(sorted(EXCLUDED_UPDATE_FILES))}")
 
     write_err = _check_writable()
     if write_err:
@@ -328,14 +376,18 @@ async def perform_update() -> bool:
         return False
 
     try:
-        written, failed = 0, 0
+        written, failed, skipped = 0, 0, 0
         fail_msgs = []
         async with httpx.AsyncClient(follow_redirects=True) as client:
             total = len(files)
             for i, entry in enumerate(files, start=1):
+                is_excluded = _is_excluded_path(entry.get("path", ""))
+                if is_excluded:
+                    skipped += 1
                 ok, err = await _download_one_file(client, entry)
                 if ok:
-                    written += 1
+                    if not is_excluded:
+                        written += 1
                 else:
                     failed += 1
                     fail_msgs.append(f"{entry.get('path','?')}: {err}")
@@ -343,10 +395,10 @@ async def perform_update() -> bool:
                 # پیشرفت بین 15 تا 90 درصد رو متناسب با تعداد فایل‌ها آپدیت کن
                 update_state["progress"] = 15 + int((i / total) * 75)
 
-        _log(f"دانلود تمام شد. نوشته‌شده: {written} | خطادار: {failed}")
+        _log(f"دانلود تمام شد. نوشته‌شده: {written} | رد شده (محافظت‌شده): {skipped} | خطادار: {failed}")
         update_state["progress"] = 92
 
-        if written == 0:
+        if written == 0 and skipped == 0:
             _log("❌ هیچ فایلی با موفقیت دانلود نشد؛ بروزرسانی لغو شد.")
             update_state["running"] = False
             _save_update_history_entry({
@@ -372,13 +424,19 @@ async def perform_update() -> bool:
         _manifest_cache["data"] = None
         _manifest_cache["ts"] = 0.0
 
+        note_parts = []
+        if failed:
+            note_parts.append(f"{failed} فایل با خطا رد شد")
+        if skipped:
+            note_parts.append(f"{skipped} فایل محافظت‌شده آپدیت نشد")
+
         _save_update_history_entry({
             "time": time.time(),
             "from_version": old_version,
             "to_version": new_version,
             "description": new_description,
             "status": "ok",
-            "note": (f"{failed} فایل با خطا رد شد" if failed else None),
+            "note": ("، ".join(note_parts) if note_parts else None),
         })
         return True
 
