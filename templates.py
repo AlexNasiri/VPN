@@ -1,4 +1,4 @@
-"""قالب‌های HTML صفحه‌ی ورود و داشبورد Vortex.
+"""قالب‌های HTML صفحه‌ی ورود و داشبورد .
 
 بازطراحی کامل — کانسپت «Ops Console»: یک زبان بصری یکپارچه برای هر
 سه صفحه (ورود، داشبورد، Subscription) به‌جای سه سبک ناهمخوان قبلی.
@@ -58,7 +58,7 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ورود · Vortex</title>
+<title>ورود · </title>
 """ + FONT_LINKS + """
 <style>
 """ + BASE_TOKENS + """
@@ -139,7 +139,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
         <svg viewBox="0 0 24 24" fill="none">""" + BRAND_MARK_SVG + """</svg>
       </div>
     </div>
-    <div class="beacon-name">VORTEX</div>
+    <div class="beacon-name"></div>
     <div class="beacon-tag">Gateway Control</div>
   </div>
 
@@ -158,7 +158,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
       <div id="hint" style="display:none;font-size:11px;line-height:1.9;color:var(--text-dim);margin:-4px 0 14px">حداقل ۴ کاراکتر؛ می‌تواند شامل هر نوع حرف، عدد یا نماد باشد.</div>
       <button class="submit" id="btn" type="submit"><i class="ti ti-bolt"></i> ورود به پنل</button>
     </form>
-    <div class="foot">Vortex Gateway · Encrypted Session</div>
+    <div class="foot">Gateway · Encrypted Session</div>
   </div>
 </div>
 
@@ -232,7 +232,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Vortex · Control Center</title>
+<title>· Control Center</title>
 """ + FONT_LINKS + r"""
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <style>
@@ -470,7 +470,7 @@ button{cursor:pointer}
   <aside class="sidebar">
     <div class="brand">
       <div class="brand-mark"><svg viewBox="0 0 24 24" fill="none">""" + BRAND_MARK_SVG + SIGNAL_SVG_DEFS + r"""</svg></div>
-      <div><div class="brand-name">VORTEX</div><span class="brand-caption">gateway control</span></div>
+      <div><div class="brand-name"></div><span class="brand-caption">gateway control</span></div>
       <button class="menu-toggle" id="menuToggle" aria-label="باز کردن منو"><i class="ti ti-menu-2"></i></button>
     </div>
     <div class="sidebar-menu" id="sidebarMenu">
@@ -496,14 +496,14 @@ button{cursor:pointer}
 
   <div class="main">
     <header class="topbar">
-      <div class="context"><div class="context-title">مرکز کنترل Vortex</div><div class="context-sub" id="lastUpdate">در حال همگام‌سازی...</div></div>
+      <div class="context"><div class="context-title">مرکز کنترل </div><div class="context-sub" id="lastUpdate">در حال همگام‌سازی...</div></div>
       <div class="top-actions"><span class="top-pill"><span class="dot"></span> سرویس آنلاین</span><button class="top-icon" id="refreshBtn" title="به‌روزرسانی"><i class="ti ti-refresh"></i></button></div>
     </header>
 
     <main class="stage">
       <section class="vx-page active" id="page-overview">
         <div class="overview-intro">
-          <div class="intro-copy"><div class="eyebrow">VORTEX / CONTROL CENTER</div><h1>مدیریت گیت‌وی، در یک نگاه.</h1><p>وضعیت سرویس، کانفیگ‌های فعال، مصرف و رخدادها را همین‌جا و بدون شلوغی ببین.</p></div>
+          <div class="intro-copy"><div class="eyebrow">/ CONTROL CENTER</div><h1>مدیریت گیت‌وی، در یک نگاه.</h1><p>وضعیت سرویس، کانفیگ‌های فعال، مصرف و رخدادها را همین‌جا و بدون شلوغی ببین.</p></div>
           <div class="command-panel"><div class="command-kicker">SERVER STATE</div><div class="command-value" id="statUptime">--</div><div class="command-meta"><span>Links <strong id="statLinks">0</strong></span><span>Host <strong id="statHost">--</strong></span></div></div>
         </div>
         <div class="signal-row">
@@ -567,7 +567,7 @@ button{cursor:pointer}
       <section class="vx-page" id="page-errors"><div class="page-head"><div><div class="page-title">گزارش خطا</div><div class="page-sub">آخرین رخدادهای ثبت‌شده</div></div></div><div class="error-list" id="errorsWrap"><div class="empty"><i class="ti ti-circle-check"></i>خطایی ثبت نشده</div></div></section>
 
       <section class="vx-page" id="page-system">
-        <div class="page-head"><div><div class="page-title">وضعیت سیستم</div><div class="page-sub">یک نگاه سریع به سلامت Vortex و آماده‌بودن Railway</div></div><button class="btn btn-grad" id="systemRefreshBtn"><i class="ti ti-refresh"></i> بررسی دوباره</button></div>
+        <div class="page-head"><div><div class="page-title">وضعیت سیستم</div><div class="page-sub">یک نگاه سریع به سلامت و آماده‌بودن Railway</div></div><button class="btn btn-grad" id="systemRefreshBtn"><i class="ti ti-refresh"></i> بررسی دوباره</button></div>
         <div class="signal-row" id="systemSignals">
           <div class="signal"><div class="signal-label">Database</div><div class="signal-value" id="sysDb">—</div><div class="signal-note" id="sysDbNote">در حال بررسی</div></div>
           <div class="signal"><div class="signal-label">Storage</div><div class="signal-value" id="sysStorage">—</div><div class="signal-note" id="sysStorageNote">در حال بررسی</div></div>
@@ -584,7 +584,7 @@ button{cursor:pointer}
           </div>
           <aside class="side-rail">
             <div class="rail-block"><div class="rail-title">Storage</div><p style="font-size:10px;line-height:1.9;color:var(--text-dim);margin-bottom:10px">قبل از استفاده جدی، مطمئن شو دیتابیس روی Volume پایدار قرار دارد.</p><button class="btn btn-grad" id="storageTestBtn" style="width:100%;justify-content:center"><i class="ti ti-device-floppy"></i> تست نوشتن</button></div>
-            <div class="rail-block"><div class="rail-title">راهنمای Railway</div><p style="font-size:10px;line-height:1.9;color:var(--text-dim)">اگر Storage قرمز بود، یک Volume با مسیر <code>/data</code> متصل کن. بقیه تنظیمات توسط Vortex مدیریت می‌شود.</p></div>
+            <div class="rail-block"><div class="rail-title">راهنمای Railway</div><p style="font-size:10px;line-height:1.9;color:var(--text-dim)">اگر Storage قرمز بود، یک Volume با مسیر <code>/data</code> متصل کن. بقیه تنظیمات توسط مدیریت می‌شود.</p></div>
           </aside>
         </div>
       </section>
@@ -596,7 +596,7 @@ button{cursor:pointer}
           <div class="settings-content">
             <section class="setting-section"><h3>امنیت پنل</h3><p>رمز عبور مدیریت را بدون تغییر سایر تنظیمات سرویس به‌روزرسانی کن.</p><div class="setting-form"><div class="field"><label>رمز فعلی</label><input type="password" id="curPass"></div><div class="field"><label>رمز جدید</label><input type="password" id="newPass"></div><button class="btn btn-grad" id="changePasswordBtn"><i class="ti ti-lock-check"></i> ذخیره رمز</button></div></section>
             <section class="setting-section wide"><h3>Cloudflare Worker Relay</h3>
-              <p>Worker فقط <strong>Relay</strong> است: <span dir="ltr">Client → Cloudflare Worker → Vortex Gateway</span>. منطق VLESS و احراز هویت روی Gateway می‌ماند؛ Worker صرفاً درخواست را به Origin عبور می‌دهد.</p>
+              <p>Worker فقط <strong>Relay</strong> است: <span dir="ltr">Client → Cloudflare Worker → Gateway</span>. منطق VLESS و احراز هویت روی Gateway می‌ماند؛ Worker صرفاً درخواست را به Origin عبور می‌دهد.</p>
               <div id="cfStatusBox" style="margin:12px 0;padding:13px;border:1px solid var(--line);border-radius:12px;background:var(--bg2)">
                 <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px"><strong>وضعیت Worker</strong><span id="cfStatusBadge" class="badge dim">بررسی نشده</span></div>
                 <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 14px;font-size:10px;line-height:1.9">
@@ -618,7 +618,7 @@ button{cursor:pointer}
               <div id="cfDomainList" style="display:none;margin-top:10px;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--bg2)"></div>
               <div id="cfWorkerInfo" style="display:none;margin-top:12px;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--bg2);font-size:11px;line-height:2"></div>
             </section>
-            <section class="setting-section"><h3>بکاپ و بازیابی</h3><p>از تنظیمات و لینک‌ها نسخه پشتیبان بگیر یا یک فایل قبلی را برگردان.</p><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-grad" id="downloadBackupBtn"><i class="ti ti-download"></i> دریافت بکاپ</button><button class="btn" id="restoreFileBtn"><i class="ti ti-upload"></i> بازیابی</button><input type="file" id="restoreFile" accept=".vortex,application/octet-stream" style="display:none"></div></section>
+            <section class="setting-section"><h3>بکاپ و بازیابی</h3><p>از تنظیمات و لینک‌ها نسخه پشتیبان بگیر یا یک فایل قبلی را برگردان.</p><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-grad" id="downloadBackupBtn"><i class="ti ti-download"></i> دریافت بکاپ</button><button class="btn" id="restoreFileBtn"><i class="ti ti-upload"></i> بازیابی</button><input type="file" id="restoreFile" accept=".,application/octet-stream" style="display:none"></div></section>
             <section class="setting-section"><h3>بروزرسانی نرم‌افزار</h3><p>نسخه فعلی: <b id="settingsCurrentVersion" style="font-family:var(--f-mono)">—</b><br>پنل به‌صورت خودکار Commit جدید مخزن گیت‌هاب پروژه را چک می‌کند. وقتی چیزی جدید پیدا شود، همینجا و در بالای صفحه اطلاع داده می‌شود و فقط کافیست دکمه‌ی «بروزرسانی» را بزنی.</p><div id="updateStatusBox" style="font-size:10.5px;color:var(--text-dim);margin-bottom:12px">در حال بررسی...</div><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-grad" id="settingsApplyUpdateBtn" style="display:none"><i class="ti ti-download"></i> بروزرسانی</button></div></section>
             <section class="setting-section wide"><h3>اعلان تلگرام</h3><p>وضعیت اتصال و ارسال پیام تست را از این بخش کنترل کن.</p><div class="mini-stat" style="max-width:520px"><span>وضعیت اتصال</span><strong id="telegramStatus">—</strong></div><button class="btn" id="sendTestNotifBtn" style="margin-top:12px"><i class="ti ti-send"></i> ارسال پیام تست</button></section>
             <section class="setting-section wide"><h3>مسدودسازی تبلیغات</h3><p>وقتی فعال باشد، مقصدهای شناخته‌شده‌ی تبلیغاتی/ردیاب (مثل شبکه‌های تبلیغاتی و آنالیتیکس پراستفاده) پیش از اتصال، مستقیم توسط گیت‌وی بسته می‌شوند — روی همه‌ی کانفیگ‌های VLESS به‌صورت یکجا اثر می‌گذارد.</p>
@@ -636,7 +636,7 @@ button{cursor:pointer}
 </div>
 
 <div class="modal-backdrop" id="setupModal"><div class="modal-box" style="max-width:620px">
-  <div class="modal-head"><div class="modal-title"><i class="ti ti-rocket"></i> راه‌اندازی اولیه Vortex</div></div>
+  <div class="modal-head"><div class="modal-title"><i class="ti ti-rocket"></i> راه‌اندازی اولیه </div></div>
   <div style="padding:6px 0 16px;line-height:2">
     <h2 style="font-size:20px;margin-bottom:8px">خوش اومدی 👋</h2>
     <p style="color:var(--text-dim);font-size:11px">پنل آماده‌ست. چند نکته مهم درباره استقرار Railway رو بررسی کنیم؛ نیازی به کدنویسی نیست.</p>
@@ -662,7 +662,7 @@ const toastEl = document.getElementById('toast');
 function toast(msg, isErr){toastEl.textContent=msg;toastEl.className='toast show'+(isErr?' err':'');setTimeout(()=>toastEl.classList.remove('show'),2600);}
 
 function getCsrfToken(){
-  const m = document.cookie.match(/(?:^|; )vortex_csrf=([^;]+)/);
+  const m = document.cookie.match(/(?:^|; )_csrf=([^;]+)/);
   return m ? decodeURIComponent(m[1]) : '';
 }
 async function apiFetch(url, options={}){
@@ -1105,7 +1105,7 @@ function buildCloudflareTokenUrl(){
   const params = new URLSearchParams({
     permissionGroupKeys: JSON.stringify(CF_TOKEN_PERMISSION_GROUPS),
     accountId: '*',
-    name: 'Vortex-Gateway-Token',
+    name: '-Gateway-Token',
   });
   return 'https://dash.cloudflare.com/profile/api-tokens?' + params.toString();
 }
@@ -1229,7 +1229,7 @@ async function downloadBackup(){
     const url=URL.createObjectURL(blob);
     const a=document.createElement('a');
     a.href=url;
-    a.download='vortex-backup-'+new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')+'.vortex';
+    a.download='-backup-'+new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')+'.';
     document.body.appendChild(a); a.click(); a.remove();
     URL.revokeObjectURL(url);
     toast('بکاپ دانلود شد');
@@ -1363,7 +1363,7 @@ async function loadSystemStatus(){
     document.getElementById('sysRedis').textContent=redis.connected?'READY':(redis.configured?'ERROR':'OFF');
     document.getElementById('sysRedis').style.color=redis.connected?'var(--ok)':(redis.configured?'var(--relay)':'var(--muted)');
     document.getElementById('sysRedisNote').textContent=redis.configured?(redis.connected?'متصل':'تنظیم شده ولی متصل نیست'):'اختیاری؛ برای چند instance';
-    document.getElementById('sysVersion').textContent='Vortex '+(d.version||'—');
+    document.getElementById('sysVersion').textContent=''+(d.version||'—');
     document.getElementById('sysPlatform').textContent=d.railway?'Railway':'Standalone';
     document.getElementById('sysDbPath').textContent=db.path||'—';
     const free=disk.free_bytes||0; document.getElementById('sysDisk').textContent=(free/1024/1024/1024).toFixed(2)+' GB آزاد'+(disk.free_percent!=null?' ('+disk.free_percent+'%)':'');
@@ -1459,7 +1459,7 @@ SUB_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>__LABEL__ · Vortex</title>
+<title>__LABEL__ · </title>
 """ + FONT_LINKS + """
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <style>
@@ -1571,7 +1571,7 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
       <p class="sub-hint">این آدرس صفحه را در اپلیکیشن‌هایی مثل V2rayNG، NekoBox، Shadowrocket، Streisand یا Clash
         به‌عنوان «Subscription» / «Import from URL» وارد کنید تا لینک به‌صورت خودکار در اپ اضافه شود؛ یا لینک مستقیم
         بالا را دستی کپی/اسکن کنید.</p>
-      <div class="foot">VORTEX GATEWAY</div>
+      <div class="foot">GATEWAY</div>
     </div>
   </div>
 </div>
@@ -1626,7 +1626,7 @@ SUB_NOTFOUND_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>یافت نشد · Vortex</title>
+<title>یافت نشد · </title>
 """ + FONT_LINKS + """
 <style>
 """ + BASE_TOKENS + """
