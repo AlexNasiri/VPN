@@ -1,5 +1,5 @@
 """
-Gateway
+Vortex Gateway
 یک گیت‌وی تونل‌زنی VLESS روی WebSocket به همراه HTTP Proxy امن‌شده و
 داشبورد مدیریتی. طراحی و پیاده‌سازی مستقل، بدون کپی از پروژه‌های مشابه.
 """
@@ -57,8 +57,8 @@ AUTO_BACKUP_DIR = os.getenv("AUTO_BACKUP_DIR", "/data/backups")
 # عمومی گیت‌هاب را چک می‌کند. هیچ فایلی دستی جابه‌جا نمی‌شود و ادمین چیزی
 # آپلود نمی‌کند — فقط وقتی Commit جدیدی پیدا شود یک دکمه‌ی «بروزرسانی» در
 # پنل ظاهر می‌شود.
-UPDATE_GITHUB_OWNER = os.getenv("UPDATE_GITHUB_OWNER", "Worker")
-UPDATE_GITHUB_REPO = os.getenv("UPDATE_GITHUB_REPO", "")
+UPDATE_GITHUB_OWNER = os.getenv("UPDATE_GITHUB_OWNER", "VortexWorker")
+UPDATE_GITHUB_REPO = os.getenv("UPDATE_GITHUB_REPO", "vortex")
 UPDATE_GITHUB_BRANCH = os.getenv("UPDATE_GITHUB_BRANCH", "main")
 UPDATE_GITHUB_TOKEN = os.getenv("UPDATE_GITHUB_TOKEN", "")  # فقط برای Repository خصوصی/افزایش Rate limit لازم است
 UPDATES_DIR = os.getenv("UPDATES_DIR", "/data/updates")
@@ -67,10 +67,10 @@ UPDATE_MAX_PACKAGE_BYTES = int(os.getenv("UPDATE_MAX_PACKAGE_BYTES", str(30 * 10
 # ریشه‌ی پروژه که فایل‌های آپدیت روی آن اعمال می‌شوند.
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-LOG_PATH = os.environ.get("LOG_PATH", ".log")
+LOG_PATH = os.environ.get("LOG_PATH", "vortex.log")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("")
+logger = logging.getLogger("vortex")
 
 # علاوه بر لاگِ stdout (که Railway/هر پلتفرمی خودش جمع‌آوری می‌کند)، یک فایل
 # لاگ محلی هم با rotation نگه می‌داریم تا برای بررسی بعدی (مثلاً بعد از یک
@@ -86,7 +86,7 @@ try:
 except OSError as exc:
     logger.warning("امکان نوشتن فایل لاگ در %s نبود (%s) — فقط لاگ stdout فعال است.", LOG_PATH, exc)
 
-APP_NAME = "Gateway"
+APP_NAME = "Vortex Gateway"
 APP_VERSION = "4.1-hardened"
 
 async def _automatic_sqlite_backup():
@@ -118,8 +118,8 @@ async def _automatic_sqlite_backup():
 
             os.makedirs(AUTO_BACKUP_DIR, exist_ok=True)
             stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-            tmp_db = os.path.join(AUTO_BACKUP_DIR, f".-{stamp}.tmp.db")
-            backup_path = os.path.join(AUTO_BACKUP_DIR, f"-{stamp}.db.enc")
+            tmp_db = os.path.join(AUTO_BACKUP_DIR, f".vortex-{stamp}.tmp.db")
+            backup_path = os.path.join(AUTO_BACKUP_DIR, f"vortex-{stamp}.db.enc")
 
             def _backup():
                 src_conn = sqlite3.connect(db_path, timeout=30)
@@ -150,7 +150,7 @@ async def _automatic_sqlite_backup():
             await asyncio.to_thread(_backup)
 
             backups = sorted(
-                glob.glob(os.path.join(AUTO_BACKUP_DIR, "-*.db.enc")),
+                glob.glob(os.path.join(AUTO_BACKUP_DIR, "vortex-*.db.enc")),
                 key=os.path.getmtime,
                 reverse=True,
             )
@@ -382,7 +382,7 @@ CONFIG = {
     # روی Railway اگر می‌خواهید بین دیپلوی‌های مجدد (نه فقط ری‌استارت ساده)
     # هم دیتا از دست نرود، باید یک Volume به همین مسیر متصل کنید؛ وگرنه
     # فایل‌سیستم کانتینر با هر deploy از صفر ساخته می‌شود.
-    "db_path": os.environ.get("DB_PATH", "/data/_data.db"),
+    "db_path": os.environ.get("DB_PATH", "/data/vortex_data.db"),
     # On Railway, fail closed when /data is not an actual mounted Volume.
     # This prevents a fresh ephemeral SQLite DB from silently replacing the
     # persistent database and making the previously configured password fail.
@@ -1230,7 +1230,7 @@ def _maybe_schedule_quota_alert(uid: str, label: str, pct: float):
         return
     _notified_pct[uid] = crossed
     emoji = "🛑" if crossed >= 100 else "⚠️"
-    text = f"{emoji} Gateway\nلینک «{label}» به {crossed}٪ از سقف ترافیک خود رسید."
+    text = f"{emoji} Vortex Gateway\nلینک «{label}» به {crossed}٪ از سقف ترافیک خود رسید."
     if crossed >= 100:
         text += "\nاین لینک تا بازنشانی/افزایش سقف، مسدود شده است."
     asyncio.create_task(send_telegram_message(text))
@@ -1333,8 +1333,8 @@ async def _bootstrap_admin_password(settings_map: dict[str, str]) -> None:
     AUTH["password_hash"] = ""
     AUTH["setup_required"] = True
 
-SESSION_COOKIE = "_session"
-CSRF_COOKIE = "_csrf"
+SESSION_COOKIE = "vortex_session"
+CSRF_COOKIE = "vortex_csrf"
 CSRF_HEADER = "x-csrf-token"
 SESSION_TTL = 60 * 60 * 24 * 7  # 7 روز
 SESSIONS: dict = {}
@@ -1355,11 +1355,11 @@ async def check_login_allowed(ip: str) -> tuple[bool, int]:
     now = time.time()
     if redis_client is not None:
         key = hashlib.sha256(ip.encode()).hexdigest()
-        lock_key = f":login:lock:{key}"
+        lock_key = f"vortex:login:lock:{key}"
         ttl = await redis_client.ttl(lock_key)
         if ttl and ttl > 0:
             return False, int(ttl)
-        global_key = ":login:global"
+        global_key = "vortex:login:global"
         count = await redis_client.get(global_key)
         if count and int(count) >= MAX_GLOBAL_LOGIN_ATTEMPTS:
             ttl = await redis_client.ttl(global_key)
@@ -1380,9 +1380,9 @@ async def check_login_allowed(ip: str) -> tuple[bool, int]:
 async def record_login_failure(ip: str):
     if redis_client is not None:
         key = hashlib.sha256(ip.encode()).hexdigest()
-        count_key = f":login:fail:{key}"
-        lock_key = f":login:lock:{key}"
-        global_key = ":login:global"
+        count_key = f"vortex:login:fail:{key}"
+        lock_key = f"vortex:login:lock:{key}"
+        global_key = "vortex:login:global"
         pipe = redis_client.pipeline()
         pipe.incr(count_key)
         pipe.expire(count_key, LOCKOUT_SECONDS)
@@ -1403,7 +1403,7 @@ async def record_login_failure(ip: str):
 async def record_login_success(ip: str):
     if redis_client is not None:
         key = hashlib.sha256(ip.encode()).hexdigest()
-        await redis_client.delete(f":login:fail:{key}", f":login:lock:{key}")
+        await redis_client.delete(f"vortex:login:fail:{key}", f"vortex:login:lock:{key}")
         return
     async with LOGIN_LOCK:
         LOGIN_ATTEMPTS.pop(ip, None)
@@ -1447,7 +1447,7 @@ async def create_session() -> str:
     token = secrets.token_urlsafe(32)
     expires = int(SESSION_TTL)
     if redis_client is not None:
-        await redis_client.setex(f":session:{token}", expires, "1")
+        await redis_client.setex(f"vortex:session:{token}", expires, "1")
     else:
         async with SESSIONS_LOCK:
             SESSIONS[token] = time.time() + SESSION_TTL
@@ -1457,7 +1457,7 @@ async def is_valid_session(token: str | None) -> bool:
     if not token:
         return False
     if redis_client is not None:
-        return bool(await redis_client.exists(f":session:{token}"))
+        return bool(await redis_client.exists(f"vortex:session:{token}"))
     async with SESSIONS_LOCK:
         exp = SESSIONS.get(token)
         if exp is None:
@@ -1471,7 +1471,7 @@ async def destroy_session(token: str | None):
     if not token:
         return
     if redis_client is not None:
-        await redis_client.delete(f":session:{token}")
+        await redis_client.delete(f"vortex:session:{token}")
         return
     async with SESSIONS_LOCK:
         SESSIONS.pop(token, None)
@@ -1650,7 +1650,7 @@ async def lifespan(_app: FastAPI):
     panel_host = get_host()
     display_host = f"{panel_host}" if cookie_secure() else f"{panel_host}:{CONFIG['port']}"
     panel_url = f"{scheme}://{display_host}/login"
-    logger.info("🌀 پنل در آدرس زیر در دسترس است: %s", panel_url)
+    logger.info("🌀 پنل Vortex در آدرس زیر در دسترس است: %s", panel_url)
 
     limits = httpx.Limits(max_connections=300, max_keepalive_connections=50)
     timeout = httpx.Timeout(20.0, connect=8.0)
@@ -1704,7 +1704,7 @@ def _link_route_via(uid: str) -> str:
     return value if value in ("auto", "railway", "cloudflare") else "auto"
 
 
-def generate_vless_link(uid: str, host: str, remark: str = "") -> str:
+def generate_vless_link(uid: str, host: str, remark: str = "Vortex") -> str:
     route_via = _link_route_via(uid)
     worker_parts = _worker_endpoint_parts() if route_via != "railway" else None
     if worker_parts:
@@ -2198,7 +2198,7 @@ async def api_system_status(_=Depends(require_auth)):
 
 @app.post("/api/system/storage-test")
 async def api_storage_test(request: Request, _=Depends(require_auth_csrf)):
-    storage_test = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)) or os.getcwd(), ".-write-test")
+    storage_test = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)) or os.getcwd(), ".vortex-write-test")
     def _write_test():
         with open(storage_test, "w", encoding="utf-8") as fh:
             fh.write(datetime.now().isoformat())
@@ -2246,12 +2246,12 @@ async def api_change_password(payload: ChangePasswordRequest, request: Request, 
     current_token = request.cookies.get(SESSION_COOKIE)
     if redis_client is not None:
         keys = []
-        async for key in redis_client.scan_iter(match=":session:*", count=100):
+        async for key in redis_client.scan_iter(match="vortex:session:*", count=100):
             keys.append(key)
         if keys:
             await redis_client.delete(*keys)
         if current_token:
-            await redis_client.setex(f":session:{current_token}", SESSION_TTL, "1")
+            await redis_client.setex(f"vortex:session:{current_token}", SESSION_TTL, "1")
     else:
         async with SESSIONS_LOCK:
             SESSIONS.clear()
@@ -2486,7 +2486,7 @@ async def api_cloudflare_deploy_worker(payload: CloudflareWorkerRequest, request
 
         worker_name = (existing_settings.get("cloudflare_worker_name") or "").strip()
         if not worker_name:
-            worker_name = f"-{secrets.token_hex(4)}"
+            worker_name = f"vortex-{secrets.token_hex(4)}"
         # Reuse the previously deployed gate path (if any) instead of always
         # generating a brand new one. This is the direct fix for "old
         # sub/tunnel links stop working every time I rebuild the Worker":
@@ -2998,7 +2998,7 @@ async def list_connections(_=Depends(require_auth)):
 async def send_test_notification(_=Depends(require_auth_csrf)):
     if not (CONFIG["telegram_bot_token"] and CONFIG["telegram_chat_id"]):
         raise HTTPException(status_code=400, detail="TELEGRAM_BOT_TOKEN یا TELEGRAM_CHAT_ID تنظیم نشده است")
-    ok = await send_telegram_message("✅ Gateway: این یک پیام تستی است. اعلان‌ها درست کار می‌کنند.")
+    ok = await send_telegram_message("✅ Vortex Gateway: این یک پیام تستی است. اعلان‌ها درست کار می‌کنند.")
     if not ok:
         raise HTTPException(status_code=502, detail="ارسال پیام تلگرام ناموفق بود؛ توکن/chat_id را بررسی کنید")
     return {"ok": True}
@@ -3115,7 +3115,7 @@ async def create_link(payload: LinkCreateRequest, request: Request, _=Depends(re
         "expires_at": expires_at,
         "speed_limit_bps": speed_limit_bps,
         "route_via": payload.route_via,
-        "vless_link": generate_vless_link(uid, host, remark=f"-{label}"),
+        "vless_link": generate_vless_link(uid, host, remark=f"Vortex-{label}"),
         "sub_link": generate_sub_url(uid, host),
     }
 
@@ -3137,7 +3137,7 @@ async def list_links(_=Depends(require_auth)):
                 "speed_limit_bps": data.get("speed_limit_bps", 0),
                 "expired": is_link_expired(data),
                 "route_via": data.get("route_via") or "railway",
-                "vless_link": generate_vless_link(uid, host, remark=f"-{data['label']}"),
+                "vless_link": generate_vless_link(uid, host, remark=f"Vortex-{data['label']}"),
                 "sub_link": generate_sub_url(uid, host),
             })
     result.sort(key=lambda x: x["created_at"], reverse=True)
@@ -3306,7 +3306,7 @@ async def bulk_link_action(payload: BulkLinkActionRequest, request: Request, _=D
 # پس با فایل بکاپ مثل یک رمز عبور رفتار کنید و آن را جای امنی نگه دارید.
 
 BACKUP_VERSION = 3
-ENCRYPTED_BACKUP_PREFIX = b"-ENCRYPTED-BACKUP-V1\\n"
+ENCRYPTED_BACKUP_PREFIX = b"VORTEX-ENCRYPTED-BACKUP-V1\\n"
 
 def _backup_cipher() -> Fernet:
     key = CONFIG["backup_encryption_key"]
@@ -3349,7 +3349,7 @@ async def export_backup(_=Depends(require_auth)):
     if not CONFIG["backup_encryption_key"]:
         raise HTTPException(status_code=503, detail="encrypted backups are not configured")
     content = _encrypt_backup(backup)
-    filename = f"-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}."
+    filename = f"vortex-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.vortex"
     return Response(content=content, media_type="application/octet-stream",
                     headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
@@ -3470,12 +3470,12 @@ async def restore_backup(request: Request, _=Depends(require_auth_csrf)):
         # اعمال می‌شود تا هر دو مسیر سازگار و امن باشند.
         if redis_client is not None:
             keys = []
-            async for key in redis_client.scan_iter(match=":session:*", count=100):
+            async for key in redis_client.scan_iter(match="vortex:session:*", count=100):
                 keys.append(key)
             if keys:
                 await redis_client.delete(*keys)
             if current_token:
-                await redis_client.setex(f":session:{current_token}", SESSION_TTL, "1")
+                await redis_client.setex(f"vortex:session:{current_token}", SESSION_TTL, "1")
         else:
             async with SESSIONS_LOCK:
                 SESSIONS.clear()
@@ -4075,11 +4075,11 @@ async def _websocket_tunnel_impl(websocket: WebSocket, uid: str):
 
             up = asyncio.create_task(
                 upstream_udp_to_target(websocket, udp_transport, conn_id, uid, initial_payload),
-                name=f"-udp-up-{conn_id}",
+                name=f"vortex-udp-up-{conn_id}",
             )
             down = asyncio.create_task(
                 downstream_udp_to_client(websocket, udp_queue, conn_id, uid),
-                name=f"-udp-down-{conn_id}",
+                name=f"vortex-udp-down-{conn_id}",
             )
             done, pending = await asyncio.wait({up, down}, return_when=asyncio.FIRST_COMPLETED)
             for task in pending:
@@ -4117,8 +4117,8 @@ async def _websocket_tunnel_impl(websocket: WebSocket, uid: str):
                 writer.write(initial_payload)
                 await writer.drain()
 
-            up = asyncio.create_task(upstream_to_client(websocket, writer, conn_id, uid), name=f"-up-{conn_id}")
-            down = asyncio.create_task(downstream_to_client(websocket, reader, conn_id, uid), name=f"-down-{conn_id}")
+            up = asyncio.create_task(upstream_to_client(websocket, writer, conn_id, uid), name=f"vortex-up-{conn_id}")
+            down = asyncio.create_task(downstream_to_client(websocket, reader, conn_id, uid), name=f"vortex-down-{conn_id}")
             done, pending = await asyncio.wait({up, down}, return_when=asyncio.FIRST_COMPLETED)
             for task in pending:
                 task.cancel()
@@ -4342,7 +4342,7 @@ async def subscription_page(token: str, request: Request):
         )
 
     host = get_host()
-    vless_link = generate_vless_link(uid, host, remark=f"-{snapshot['label']}")
+    vless_link = generate_vless_link(uid, host, remark=f"Vortex-{snapshot['label']}")
     sub_link = generate_sub_url(uid, host)
     expired = is_link_expired(snapshot)
 
