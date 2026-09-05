@@ -118,8 +118,8 @@ async def _automatic_sqlite_backup():
 
             os.makedirs(AUTO_BACKUP_DIR, exist_ok=True)
             stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-            tmp_db = os.path.join(AUTO_BACKUP_DIR, f".{stamp}.tmp.db")
-            backup_path = os.path.join(AUTO_BACKUP_DIR, f"{stamp}.db.enc")
+            tmp_db = os.path.join(AUTO_BACKUP_DIR, f".vortex-{stamp}.tmp.db")
+            backup_path = os.path.join(AUTO_BACKUP_DIR, f"vortex-{stamp}.db.enc")
 
             def _backup():
                 src_conn = sqlite3.connect(db_path, timeout=30)
@@ -2486,7 +2486,7 @@ async def api_cloudflare_deploy_worker(payload: CloudflareWorkerRequest, request
 
         worker_name = (existing_settings.get("cloudflare_worker_name") or "").strip()
         if not worker_name:
-            worker_name = f"{secrets.token_hex(4)}"
+            worker_name = f"vortex-{secrets.token_hex(4)}"
         # Reuse the previously deployed gate path (if any) instead of always
         # generating a brand new one. This is the direct fix for "old
         # sub/tunnel links stop working every time I rebuild the Worker":
@@ -4075,11 +4075,11 @@ async def _websocket_tunnel_impl(websocket: WebSocket, uid: str):
 
             up = asyncio.create_task(
                 upstream_udp_to_target(websocket, udp_transport, conn_id, uid, initial_payload),
-                name=f"udp-up-{conn_id}",
+                name=f"vortex-udp-up-{conn_id}",
             )
             down = asyncio.create_task(
                 downstream_udp_to_client(websocket, udp_queue, conn_id, uid),
-                name=f"udp-down-{conn_id}",
+                name=f"vortex-udp-down-{conn_id}",
             )
             done, pending = await asyncio.wait({up, down}, return_when=asyncio.FIRST_COMPLETED)
             for task in pending:
@@ -4117,8 +4117,8 @@ async def _websocket_tunnel_impl(websocket: WebSocket, uid: str):
                 writer.write(initial_payload)
                 await writer.drain()
 
-            up = asyncio.create_task(upstream_to_client(websocket, writer, conn_id, uid), name=f"up-{conn_id}")
-            down = asyncio.create_task(downstream_to_client(websocket, reader, conn_id, uid), name=f"down-{conn_id}")
+            up = asyncio.create_task(upstream_to_client(websocket, writer, conn_id, uid), name=f"vortex-up-{conn_id}")
+            down = asyncio.create_task(downstream_to_client(websocket, reader, conn_id, uid), name=f"vortex-down-{conn_id}")
             done, pending = await asyncio.wait({up, down}, return_when=asyncio.FIRST_COMPLETED)
             for task in pending:
                 task.cancel()
